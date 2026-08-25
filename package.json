@@ -1,0 +1,23 @@
+{
+  "name": "swoop",
+  "version": "1.0.0",
+  "description": "B2C home-services marketplace demonstrating a full payment lifecycle on Hyperswitch: authorize, capture, partial capture, void, refund, extended authorization, webhooks and a double-entry ledger.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22.5.0" },
+  "scripts": {
+    "start": "node --experimental-sqlite server/index.js",
+    "dev": "node --watch --experimental-sqlite server/index.js",
+    "test": "node --experimental-sqlite --test test/*.test.js",
+    "test:core": "node --experimental-sqlite --test test/core.test.js",
+    "test:api": "node --experimental-sqlite --test test/api.test.js",
+    "test:client": "node --experimental-sqlite --test test/client.test.js",
+    "test:journey": "node --experimental-sqlite --test test/journey.test.js",
+    "verify": "node scripts/verify-hyperswitch.mjs",
+    "webhook:test": "node scripts/send-test-webhook.mjs"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "keywords": ["hyperswitch", "marketplace", "payments", "ledger", "escrow", "juspay"]
+}

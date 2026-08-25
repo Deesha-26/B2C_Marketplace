@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0B1B2B">
+<title>Swoop — home services, fast</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+<!-- Hyperswitch Web SDK: card data stays in their iframe, never in our DOM. -->
+<script src="https://beta.hyperswitch.io/v1/HyperLoader.js"></script>
+</head>
+<body>
+  <div class="app">
+    <div class="strip" id="strip" hidden>
+      <div class="strip-row">
+        <span class="strip-label" id="who">Swoop wallet</span>
+        <span class="strip-total mono" id="wTotal">$0.00</span>
+      </div>
+      <div class="bar" id="wBar"></div>
+      <div class="legend" id="wLegend"></div>
+      <div class="strip-warn" id="wWarn"></div>
+    </div>
+    <main id="view"></main>
+  </div>
+  <nav class="nav" id="nav" hidden></nav>
+  <div id="modal"></div>
+  <div id="toast"></div>
+  <div class="sr" role="status" aria-live="polite" id="live"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,674 @@
+/* Swoop customer app.
+   Card data never touches this file — the Hyperswitch SDK renders payment
+   fields in its own iframe, which is what keeps us out of PCI scope. */
+
+const S = {
+  screen: 'home', user: null, wallet: 0, canBook: false, activity: [],
+  config: {}, jobs: [], job: null, bids: [], sel: null, chat: [],
+  draft: { service: 'Plumbing' }, rating: 0, tip: 0, van: { x: 12, y: 84 },
+  pings: 0, eta: 22, busy: false, error: null, loading: true, lastRouting: null,
+};
+
+/* ------------------------------------------------------------------ utils */
+const $ = id => document.getElementById(id);
+const fmt = c => (c < 0 ? '-' : '') + '$' + (Math.abs(c ?? 0) / 100).toFixed(2);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]));
+const initials = n => String(n).split(' ').map(w => w[0]).join('').slice(0, 2);
+const say = t => { $('live').textContent = t; };
+
+let toastT;
+function toast(msg) {
+  $('toast').innerHTML = `<div class="toast">${esc(msg)}</div>`;
+  say(msg); clearTimeout(toastT);
+  toastT = setTimeout(() => { $('toast').innerHTML = ''; }, 3400);
+}
+
+let USER = localStorage.getItem('swoop_user') || null;
+async function api(method, path, body) {
+  const res = await fetch(path, {
+    method, headers: { 'Content-Type': 'application/json', 'x-swoop-user': USER || 'anon' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) { const e = new Error(json.error || `Request failed (${res.status})`); e.status = res.status; throw e; }
+  return json;
+}
+
+const ICON = {
+  Plumbing: 'M8 4v6a4 4 0 0 0 8 0V4M6 20h12M12 14v6',
+  Electrical: 'M13 3 5 14h6l-2 7 8-11h-6l2-7z',
+  Locksmith: 'M7 11V8a5 5 0 0 1 10 0v3M5 11h14v9H5z',
+  'Appliance repair': 'M4 4h16v16H4zM4 9h16M8 6h.01M12 6h.01',
+  HVAC: 'M4 7h16M4 12h16M4 17h16',
+  Home: 'M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z',
+  Jobs: 'M4 7h16v13H4zM9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2',
+  Wallet: 'M3 7h18v12H3zM3 7l2-3h12l2 3M16 13h2',
+  Empty: 'M4 7h16v13H4zM9 12h6',
+};
+const icon = (name, cls = '') =>
+  `<svg viewBox="0 0 24 24" class="${cls}" aria-hidden="true" stroke-linecap="round" stroke-linejoin="round"><path d="${ICON[name] || ICON.Empty}"/></svg>`;
+
+/* ---------------------------------------------------------------- loading */
+async function refresh() {
+  const me = await api('GET', '/api/me');
+  S.user = me.user; S.wallet = me.wallet ?? 0; S.canBook = !!me.canBook;
+  S.withdrawable = me.withdrawable ?? 0;   // credit isn't refundable to a card
+  S.activity = list(me.activity);
+  S.jobs = list(await api('GET', '/api/jobs'));
+  S.loading = false;
+}
+async function loadJob(id) {
+  const d = await api('GET', `/api/jobs/${id}`);
+  S.job = d.job; S.bids = d.bids; S.jobPayment = d.payment; S.jobEvents = d.events;
+}
+
+/* ------------------------------------------------------------ wallet strip */
+function renderStrip() {
+  if (!S.user) { $('strip').hidden = true; return; }
+  $('strip').hidden = false;
+  const hold = S.job && ['SCHEDULED', 'EN_ROUTE', 'ARRIVED', 'IN_PROGRESS'].includes(S.job.state)
+    ? (S.jobPayment?.amount ?? 0) : 0;
+  $('who').textContent = `${S.user.name} · wallet`;
+  $('wTotal').textContent = fmt(S.wallet);
+  const parts = [['wallet', S.wallet, 'Available', '#5AE0A8'], ['hold', hold, 'Held on card', '#5A6CF5']];
+  const sum = parts.reduce((s, p) => s + p[1], 0);
+  $('wBar').innerHTML = sum === 0 ? '<div class="seg seg-empty"></div>'
+    : parts.filter(p => p[1] > 0).map(p => `<div class="seg seg-${p[0]}" style="flex-grow:${p[1]}"></div>`).join('');
+  $('wLegend').innerHTML = parts.map(p =>
+    `<span><span class="dot" style="background:${p[3]}"></span>${p[2]} <b class="mono">${fmt(p[1])}</b></span>`).join('');
+  $('wWarn').textContent = S.wallet < (S.config.walletFloor ?? 2500)
+    ? `Keep ${fmt(S.config.walletFloor)} in your wallet to book — it covers tips.` : '';
+}
+
+/* ================================================================ screens */
+const V = {};
+
+V.home = () => `
+<div class="screen">
+  <div class="eyebrow">Swoop</div>
+  <h1>What needs fixing?</h1>
+  <p class="sub">Post a job, compare real bids, watch them arrive.</p>
+
+  <div class="grid" style="margin-top:var(--s4)">
+    ${['Plumbing', 'Electrical', 'Locksmith', 'Appliance repair', 'HVAC'].map(s => `
+      <button class="tile" aria-pressed="${S.draft.service === s}" onclick="pick('${s}')">
+        ${icon(s)}<span>${s}</span></button>`).join('')}
+  </div>
+
+  ${!S.canBook ? `
+    <div class="note warn"><b>Add ${fmt((S.config.walletFloor ?? 2500) - S.wallet)} to get started.</b><br>
+      Swoop keeps a ${fmt(S.config.walletFloor)} minimum in your wallet so you can tip instantly.
+      Jobs themselves are charged to your card, not the wallet.</div>
+    <button class="btn" onclick="openTopup()">Add money</button>`
+    : `<button class="btn" onclick="go('post')">Continue with ${esc(S.draft.service)}</button>`}
+
+  ${activeJob() ? `
+    <div class="sectionhead"><h3>In progress</h3></div>
+    ${jobCard(activeJob())}` : ''}
+</div>`;
+
+V.post = () => `
+<div class="screen">
+  <button class="back" onclick="go('home')">← Services</button>
+  <div class="eyebrow">${esc(S.draft.service)}</div>
+  <h1>Tell us what's wrong</h1>
+  <label for="desc">Describe the job</label>
+  <textarea id="desc" placeholder="Kitchen tap dripping steadily, cabinet underneath is damp"
+    oninput="S.draft.desc=this.value;hint()">${esc(S.draft.desc || '')}</textarea>
+  <p class="sub" id="deschint">${(S.draft.desc || '').length < 8
+    ? 'A sentence or two helps providers bid accurately.' : 'Good — enough for a provider to price it.'}</p>
+
+  <label for="addr">Address</label>
+  <input id="addr" value="${esc(S.draft.address || '118 Mathilda Pl, Sunnyvale, CA')}" oninput="S.draft.address=this.value">
+  <div class="row">
+    <div><label for="d">Date</label><input id="d" type="date" value="${new Date().toISOString().slice(0, 10)}"></div>
+    <div><label for="t">Time</label><input id="t" type="time" value="14:00"></div>
+  </div>
+
+  <label>How urgent?</label>
+  <div class="chips">
+    <button class="chip" aria-pressed="${!S.draft.urgent}" onclick="S.draft.urgent=false;render()">Scheduled</button>
+    <button class="chip urgent" aria-pressed="${!!S.draft.urgent}" onclick="S.draft.urgent=true;render()">Emergency</button>
+  </div>
+  <p class="sub">${S.draft.urgent
+    ? 'Goes to the top of every nearby provider\u2019s list. Bids come in higher.'
+    : 'Providers bid for the slot you chose.'}</p>
+
+  <button class="btn ${S.draft.urgent ? 'btn-signal' : ''}" onclick="submitJob()"
+    ${(S.draft.desc || '').length < 8 || S.busy ? 'disabled' : ''}>
+    ${S.busy ? 'Posting…' : 'Request bids'}</button>
+  <p class="sub" style="text-align:center">Nothing is charged until you pick a provider.</p>
+</div>`;
+
+V.bids = () => {
+  const best = bestOf();
+  return `
+<div class="screen">
+  <button class="back" onclick="go('home')">← Home</button>
+  <div class="eyebrow">${esc(S.job.service)}${S.job.is_emergency ? ' · Emergency' : ''}</div>
+  <h1>${S.bids.length ? `${S.bids.length} providers bid` : 'Finding providers'}</h1>
+  <p class="sub">${S.bids.length
+    ? 'Choosing one places a hold on your card for that amount. You\u2019re charged when the work is done.'
+    : 'Notifying providers near you.'}</p>
+
+  ${S.bids.length === 0 ? `<div class="card" style="margin-top:var(--s4)">
+      <div class="skel" style="width:60%"></div><div class="skel" style="width:40%;margin-top:8px"></div></div>` : ''}
+
+  ${S.bids.map((b, i) => `
+    <button class="card tap ${S.sel === i ? 'sel' : ''}" aria-pressed="${S.sel === i}" onclick="S.sel=${i};render()"
+      style="margin-top:var(--s3)">
+      <div class="flex">
+        <div class="who">
+          <span class="avatar v${(i % 3) + 1}">${initials(b.provider_name)}</span>
+          <span><b>${esc(b.trade)}</b><br>
+            <span class="sub">${esc(b.provider_name)} · ★ ${b.rating} · ${b.jobs_done} jobs</span></span>
+        </div>
+        <span class="mono" style="font-weight:700">${fmt(b.charge)}</span>
+      </div>
+      ${b.note ? `<p class="sub" style="margin-top:var(--s2)">${esc(b.note)}</p>` : ''}
+      <div>
+        ${best.cheap === i ? '<span class="tag tag-best">Lowest price</span>' : ''}
+        ${best.fast === i ? '<span class="tag tag-best">Arrives soonest</span>' : ''}
+        ${best.top === i ? '<span class="tag tag-best">Highest rated</span>' : ''}
+        <span class="tag tag-live">${b.eta_minutes} min away</span>
+        <span class="tag"><span class="verified">✓ Verified</span></span>
+      </div>
+    </button>`).join('')}
+
+  ${S.sel != null ? (() => { const b = S.bids[S.sel]; return `
+    <div class="breakdown">
+      <div><span>${esc(b.trade)}</span><span class="mono">${fmt(b.bid)}</span></div>
+      <div><span>Swoop service fee (7.5%)</span><span class="mono">${fmt(b.fee)}</span></div>
+      <div class="tot"><span>Held on your card</span><span class="mono">${fmt(b.charge)}</span></div>
+    </div>
+    <button class="btn" onclick="acceptBid()" ${S.busy ? 'disabled' : ''}>
+      ${S.busy ? 'Contacting your bank…' : `Book ${esc(b.provider_name.split(' ')[0])}`}</button>`; })()
+    : S.bids.length ? '<p class="sub" style="text-align:center;margin-top:var(--s4)">Tap a bid to see the total.</p>' : ''}
+  ${S.error ? `<div class="note bad"><b>${esc(S.error)}</b></div>` : ''}
+</div>`;
+};
+
+V.track = () => {
+  const st = S.job.state;
+  const steps = [['Booked', 'SCHEDULED'], ['On the way', 'EN_ROUTE'], ['Arrived', 'ARRIVED'],
+                 ['Working', 'IN_PROGRESS'], ['Done', 'COMPLETED']];
+  const idx = steps.findIndex(s => s[1] === st);
+  const bid = acceptedBid();
+  const t = tier(st);
+  const stamps = Object.fromEntries((S.jobEvents || []).map(e => [e.kind, new Date(e.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })]));
+  return `
+<div class="screen">
+  <button class="back" onclick="go('home')">← Home</button>
+  <div class="eyebrow">${S.job.is_emergency ? 'Emergency · ' : ''}${esc(S.job.service)}</div>
+  <div class="who" style="margin-top:4px">
+    <span class="avatar">${initials(bid?.provider_name || '?')}</span>
+    <span><h2>${esc(bid?.provider_name || 'Provider')}</h2>
+      <span class="sub">${esc(bid?.trade || '')} · ★ ${bid?.rating ?? ''} <span class="verified">✓ Verified</span></span></span>
+  </div>
+
+  <div class="map" style="margin-top:var(--s4)" aria-label="Provider location">
+    <div class="road" style="left:0;right:0;top:52%;height:9px"></div>
+    <div class="road" style="top:0;bottom:0;left:66%;width:9px"></div>
+    <div class="pin pin-home" style="left:70%;top:26%"></div>
+    <div class="pin pin-van" style="left:${S.van.x}%;top:${S.van.y}%"></div>
+    <div class="eta">${st === 'EN_ROUTE' ? `~${S.eta} min away` : st === 'SCHEDULED' ? 'Not set off yet'
+      : st === 'ARRIVED' ? 'At your door' : 'On site'}</div>
+  </div>
+  <p class="sub mono" style="font-size:11px">${S.pings} location pings recorded — kept as evidence for this job</p>
+
+  <ul class="tl">${steps.map((s, i) => `<li class="${i < idx ? 'done' : i === idx ? 'now' : ''}">
+    <b>${s[0]}</b><div class="t mono">${stamps[s[1]] || '—'}</div></li>`).join('')}</ul>
+
+  <div class="card">
+    <div class="flex"><span class="sub">Held on your card</span><span class="mono">${fmt(S.jobPayment?.amount)}</span></div>
+    <div class="flex"><span class="sub">Charged</span><span class="sub">When the job is finished</span></div>
+    ${S.jobPayment?.captureBy ? `<div class="flex"><span class="sub">Hold valid until</span>
+      <span class="sub mono">${new Date(S.jobPayment.captureBy).toLocaleString()}</span></div>` : ''}
+  </div>
+
+  <div class="note ${t.tone}"><b>${t.head}</b><br>${t.detail}</div>
+  <button class="btn btn-quiet" onclick="askCancel()">Cancel this job</button>
+
+  <div class="sectionhead"><h3>Messages</h3></div>
+  <div class="chat" id="chat">${S.chat.map(m => `<div class="msg ${m.me ? 'me' : 'them'}">${esc(m.text)}</div>`).join('')
+    || '<p class="sub">Say hello, or ask about arrival.</p>'}</div>
+  <div class="row" style="margin-top:var(--s2)">
+    <input id="msg" placeholder="Message ${esc(bid?.provider_name.split(' ')[0] || '')}" onkeydown="if(event.key==='Enter')sendMsg()">
+    <button class="btn btn-sm" style="flex:0 0 74px" onclick="sendMsg()">Send</button>
+  </div>
+
+  <div class="sectionhead"><h3 class="sub" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase">Demo — provider side</h3></div>
+  <button class="btn btn-ghost" onclick="advance()" ${S.busy ? 'disabled' : ''}>
+    ${idx < 4 ? `Advance to “${steps[idx + 1][0]}”` : 'Finish'}</button>
+  ${st === 'SCHEDULED' ? `<button class="btn btn-ghost" onclick="providerCancel()">Provider cancels</button>` : ''}
+</div>`;
+};
+
+V.review = () => {
+  const bid = acceptedBid(), first = bid?.provider_name.split(' ')[0] || 'them';
+  return `
+<div class="screen">
+  <div class="eyebrow">Job complete</div>
+  <h1>How did ${esc(first)} do?</h1>
+  <p class="sub">${fmt(bid?.charge)} was charged to your card.</p>
+  <div class="stars">${[1, 2, 3, 4, 5].map(n =>
+    `<button class="star ${S.rating >= n ? 'on' : ''}" aria-label="${n} star${n > 1 ? 's' : ''}" onclick="S.rating=${n};render()">★</button>`).join('')}</div>
+  <p class="sub">${['Tap to rate', 'Poor', 'Not great', 'Fine', 'Good', 'Excellent'][S.rating]}</p>
+  <label for="rev">Add a note (optional)</label>
+  <textarea id="rev" placeholder="Turned up early and explained the fix"></textarea>
+
+  <div class="sectionhead"><h3>Add a tip</h3></div>
+  <p class="sub">Paid from your ${fmt(S.wallet)} wallet. ${esc(first)} keeps every cent — Swoop takes nothing.</p>
+  <div class="chips" style="margin-top:var(--s2)">
+    ${[0, 500, 1000, 2000].map(t => `<button class="chip" aria-pressed="${S.tip === t}"
+      ${t > S.wallet ? 'disabled' : ''} onclick="S.tip=${t};render()">${t === 0 ? 'No tip' : fmt(t)}</button>`).join('')}
+  </div>
+  ${S.wallet < 2000 ? '<p class="sub">Greyed-out amounts are more than your wallet holds.</p>' : ''}
+  <button class="btn" onclick="finish()" ${S.rating === 0 || S.busy ? 'disabled' : ''}>
+    ${S.rating === 0 ? 'Rate to continue' : S.tip > 0 ? `Submit and tip ${fmt(S.tip)}` : 'Submit review'}</button>
+</div>`;
+};
+
+V.jobs = () => `
+<div class="screen">
+  <div class="eyebrow">History</div>
+  <h1>Your jobs</h1>
+  ${S.jobs.length === 0 ? `<div class="empty">${icon('Empty')}<p>No jobs yet.</p>
+    <button class="btn btn-ghost btn-sm" style="margin-top:var(--s3)" onclick="go('home')">Book your first</button></div>`
+    : S.jobs.map(j => jobCard(j)).join('')}
+</div>`;
+
+V.wallet = () => `
+<div class="screen">
+  <div class="eyebrow">Wallet</div>
+  <h1>${fmt(S.wallet)}</h1>
+  <p class="sub">Covers tips and refunds. Jobs are charged to your card.</p>
+  <button class="btn" onclick="openTopup()">Add money</button>
+  ${S.wallet > 0 ? `<button class="btn btn-ghost" onclick="withdraw()">Withdraw to card</button>` : ''}
+
+  ${S.lastRouting?.length ? `
+    <div class="sectionhead"><h3>How your last payment was routed</h3></div>
+    <div class="trail">${S.lastRouting.map(a => `
+      <div class="trail-row ${a.errorCode ? 'no' : 'ok'}">
+        <span class="trail-n">${a.n}</span>
+        <span><b>${esc(a.connector || 'unknown')}</b>${a.errorCode ? ` — ${esc(a.errorCode)}` : ' — succeeded'}</span>
+      </div>`).join('')}</div>
+    <p class="sub">Swoop doesn\u2019t pick the processor. Hyperswitch routes it, and retries elsewhere if the first declines.</p>` : ''}
+
+  <div class="sectionhead"><h3>Activity</h3></div>
+  <div class="ledger">
+    ${S.activity.length === 0 ? '<p class="sub">Nothing yet.</p>' : S.activity.map(e => `
+      <div class="e"><span>${esc(label(e.reason))}<br>
+        <span class="sub mono" style="font-size:11px">${new Date(e.at).toLocaleString()}</span></span>
+        <span class="mono ${e.delta < 0 ? 'neg' : e.delta > 0 ? 'pos' : ''}">${e.delta ? fmt(e.delta) : '—'}</span></div>`).join('')}
+  </div>
+</div>`;
+
+/* ------------------------------------------------------------- fragments */
+const STATE_LABEL = {
+  OPEN_FOR_BIDS: 'Taking bids', SCHEDULED: 'Booked', EN_ROUTE: 'On the way',
+  ARRIVED: 'Arrived', IN_PROGRESS: 'In progress', COMPLETED: 'Completed',
+  CANCELLED_BY_CUSTOMER: 'Cancelled', CANCELLED_BY_PROVIDER: 'Provider cancelled',
+};
+const jobCard = j => `
+  <button class="card tap" onclick="openJob('${j.id}')" style="margin-top:var(--s2)">
+    <div class="flex"><b>${esc(j.service)}</b>
+      <span class="tag ${['COMPLETED'].includes(j.state) ? 'tag-live'
+        : j.state.startsWith('CANCELLED') ? 'tag-warn' : 'tag-best'}">${STATE_LABEL[j.state] || j.state}</span></div>
+    <p class="sub">${esc(j.description)}</p>
+    <div class="sub mono" style="font-size:11px;margin-top:6px">${new Date(j.created_at).toLocaleDateString()}</div>
+  </button>`;
+
+const label = r => ({
+  WALLET_TOPUP: 'Wallet topped up', JOB_AUTHORIZED: 'Card authorized', JOB_CAPTURED: 'Card charged',
+  JOB_SETTLED: 'Job settled', TIP: 'Tip', WITHDRAWAL: 'Withdrawn to card',
+  CANCELLED_PRE_ENROUTE: 'Cancelled — hold released', CANCEL_CAPTURE: 'Cancellation charge',
+  CANCEL_SETTLE: 'Cancellation settled', PROVIDER_CANCELLED: 'Provider cancelled',
+  PROVIDER_PENALTY: 'Compensation received', REFUND_SETTLED: 'Refund settled',
+}[r] || r);
+
+/** Collections from the API are never trusted to be arrays — a single bad
+    response used to blank the home screen entirely. */
+const list = v => (Array.isArray(v) ? v : []);
+const isOver = j => {
+  const st = String(j?.state ?? '');
+  return st === 'COMPLETED' || st.startsWith('CANCELLED');
+};
+V.login = () => `
+  <div class="screen" style="padding-top:54px">
+    <div class="eyebrow">Swoop</div>
+    <h1>Get someone out to you, fast.</h1>
+    <p class="sub" style="margin-top:10px">Post the job, compare real bids, watch them arrive.
+      Your card is only charged once the work is done.</p>
+
+    <div class="section">
+      <div class="card">
+        <div class="who"><span class="avatar">1</span>
+          <span><b>Describe it once</b><div class="sub">Nearby tradespeople bid on your job.</div></span></div>
+      </div>
+      <div class="card">
+        <div class="who"><span class="avatar">2</span>
+          <span><b>Pick who you like</b><div class="sub">Prices, ratings and arrival times side by side.</div></span></div>
+      </div>
+      <div class="card">
+        <div class="who"><span class="avatar">3</span>
+          <span><b>Pay when it's finished</b><div class="sub">We hold the amount, we don't take it.</div></span></div>
+      </div>
+    </div>
+
+    <label for="email">Email</label>
+    <input id="email" type="email" inputmode="email" autocomplete="email"
+      placeholder="you@example.com" value="${esc(S.loginEmail || '')}"
+      oninput="S.loginEmail=this.value" onkeydown="if(event.key==='Enter')signIn()">
+    <button class="btn" onclick="signIn()" ${S.busy ? 'disabled' : ''}>
+      ${S.busy ? '<span class="spin"></span> Signing in' : 'Continue'}</button>
+    <p class="sub" style="text-align:center;margin-top:10px">Demo sign-in — no password, no email sent.</p>
+  </div>`;
+
+/** Derives a stable account id from the email so returning users keep their
+    wallet, jobs and saved cards. */
+async function signIn() {
+  const email = String(S.loginEmail || '').trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return toast('Enter a valid email address.');
+  S.busy = true; render();
+  USER = 'usr_' + [...email].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36);
+  localStorage.setItem('swoop_user', USER);
+  localStorage.setItem('swoop_email', email);
+  try { await refresh(); S.screen = 'home'; toast('Welcome to Swoop.'); }
+  catch { toast('Could not reach Swoop. Is the server running?'); }
+  S.busy = false; render();
+}
+
+function signOut() {
+  localStorage.removeItem('swoop_user');
+  USER = null;
+  Object.assign(S, { user: null, wallet: 0, jobs: [], job: null, bids: [], activity: [], screen: 'login' });
+  render();
+}
+
+const activeJob = () => list(S.jobs).find(j => !isOver(j));
+const acceptedBid = () => list(S.bids).find(b => b.id === S.job?.accepted_bid_id) || list(S.bids)[0];
+function bestOf() {
+  if (list(S.bids).length < 2) return {};
+  const idx = f => S.bids.reduce((b, x, i, a) => (f(x, a[b]) ? i : b), 0);
+  return { cheap: idx((x, y) => x.amount < y.amount), fast: idx((x, y) => x.eta_minutes < y.eta_minutes), top: idx((x, y) => x.rating > y.rating) };
+}
+function tier(state) {
+  const p = fmt(S.config.penalty ?? 3000);
+  if (state === 'SCHEDULED') return { tone: 'good', head: 'Free to cancel right now',
+    detail: 'They haven\u2019t set off. The hold is released and nothing is charged.' };
+  if (state === 'EN_ROUTE') return { tone: 'warn', head: `Cancelling now costs ${p}`,
+    detail: 'They\u2019re already travelling, so that covers the trip. The rest of the hold is released.' };
+  return { tone: 'bad', head: 'Cancelling now is charged in full',
+    detail: 'Work has started, so the whole amount goes through.' };
+}
+function hint() {
+  const el = document.getElementById('deschint');
+  if (el) el.textContent = (S.draft.desc || '').length < 8
+    ? 'A sentence or two helps providers bid accurately.' : 'Good — enough for a provider to price it.';
+}
+const pick = s => { S.draft.service = s; render(); };
+
+/* ------------------------------------------------------------- payments */
+let hyper = null, widgets = null, unified = null;
+
+async function mountPayment(clientSecret, mountId, onDone) {
+  hyper ??= Hyper(S.config.publishableKey);
+  widgets = hyper.widgets({ appearance: { theme: 'default' }, clientSecret });
+  unified = widgets.create('payment', {
+    // Lets the customer choose to save the card; consent travels as
+    // customer_acceptance on confirm.
+    displaySavedPaymentMethodsCheckbox: true,
+    displaySavedPaymentMethods: true,
+  });
+  unified.mount(`#${mountId}`);
+  return async () => {
+    const { error, status } = await hyper.confirmPayment({
+      widgets, confirmParams: { return_url: window.location.href }, redirect: 'if_required',
+    });
+    if (error) throw new Error(error.message || 'Payment failed');
+    return status;
+  };
+}
+
+function openTopup() {
+  const min = S.config.minTopup ?? 2500;
+  let amount = 5000;
+  $('modal').innerHTML = `
+  <div class="veil"><div class="sheet" role="dialog" aria-modal="true" aria-label="Add money">
+    <div class="grab"></div>
+    <h2>Add money</h2>
+    <p class="sub">Wallet money covers tips. Jobs are charged to your card separately.</p>
+    <label>Amount</label>
+    <div class="chips" id="amts">${[2500, 5000, 10000].map(a =>
+      `<button class="chip" aria-pressed="${a === amount}" data-a="${a}">${fmt(a)}</button>`).join('')}</div>
+    <p class="sub">Minimum ${fmt(min)}.</p>
+    <div id="payslot" style="margin-top:var(--s4);min-height:80px">
+      <div class="skel" style="height:46px"></div></div>
+    <div id="payerr"></div>
+    <button class="btn" id="paybtn" disabled>Preparing…</button>
+    <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+  </div></div>`;
+
+  const amts = $('amts');
+  amts.onclick = e => {
+    const b = e.target.closest('[data-a]'); if (!b) return;
+    amount = Number(b.dataset.a);
+    [...amts.children].forEach(c => c.setAttribute('aria-pressed', String(Number(c.dataset.a) === amount)));
+    prepare();
+  };
+
+  let confirmFn = null, token = 0;
+  async function prepare() {
+    const mine = ++token;
+    $('paybtn').disabled = true; $('paybtn').textContent = 'Preparing…';
+    $('payerr').innerHTML = '';
+    try {
+      const p = await api('POST', '/api/wallet/topup', { amount });
+      if (mine !== token) return;
+      $('payslot').innerHTML = '';
+      confirmFn = await mountPayment(p.clientSecret, 'payslot');
+      $('paybtn').disabled = false;
+      $('paybtn').textContent = `Add ${fmt(amount)}`;
+      $('paybtn').onclick = async () => {
+        $('paybtn').disabled = true; $('paybtn').textContent = 'Contacting your bank…';
+        try {
+          await confirmFn();
+          const s = await api('POST', `/api/wallet/topup/${p.paymentId}/settle`, {});
+          S.lastRouting = s.routing;
+          closeModal(); await refresh(); render();
+          toast(`${fmt(amount)} added. ${s.routing?.length > 1 ? 'Routed via ' + s.routing.at(-1).connector + ' after a retry.' : ''}`);
+        } catch (err) {
+          $('payerr').innerHTML = `<div class="note bad"><b>${esc(err.message)}</b><br>Try a different card, or a smaller amount.</div>`;
+          $('paybtn').disabled = false; $('paybtn').textContent = `Add ${fmt(amount)}`;
+        }
+      };
+    } catch (err) {
+      $('payerr').innerHTML = `<div class="note bad">${esc(err.message)}</div>`;
+      $('paybtn').textContent = 'Try again'; $('paybtn').disabled = false; $('paybtn').onclick = prepare;
+    }
+  }
+  prepare();
+}
+
+async function withdraw() {
+  try {
+    const r = await api('POST', '/api/wallet/withdraw', { amount: S.wallet });
+    await refresh(); render();
+    toast(`${fmt(r.refunds.reduce((s, x) => s + x.amount, 0))} refunded to your card.`);
+  } catch (e) { toast(e.message); }
+}
+const closeModal = () => { $('modal').innerHTML = ''; };
+
+/* --------------------------------------------------------------- actions */
+async function submitJob() {
+  S.busy = true; render();
+  try {
+    const { id } = await api('POST', '/api/jobs', {
+      service: S.draft.service, description: S.draft.desc,
+      address: S.draft.address || '118 Mathilda Pl, Sunnyvale, CA',
+      scheduledFor: new Date(Date.now() + 3 * 3.6e6).toISOString(),
+      isEmergency: !!S.draft.urgent,
+    });
+    S.busy = false;
+    await loadJob(id); await refresh(); S.sel = null; go('bids');
+    say(`${S.bids.length} bids received`);
+  } catch (e) { S.busy = false; toast(e.message); render(); }
+}
+
+async function acceptBid() {
+  const bid = S.bids[S.sel];
+  S.busy = true; S.error = null; render();
+  try {
+    const a = await api('POST', `/api/jobs/${S.job.id}/accept`, { bidId: bid.id });
+    $('modal').innerHTML = `
+      <div class="veil"><div class="sheet" role="dialog" aria-modal="true" aria-label="Confirm booking">
+        <div class="grab"></div>
+        <h2>Book ${esc(bid.provider_name)}</h2>
+        <p class="sub">We hold this on your card now and charge it when the job is finished.</p>
+        <div class="breakdown">
+          <div><span>${esc(bid.trade)}</span><span class="mono">${fmt(bid.bid)}</span></div>
+          <div><span>Swoop service fee</span><span class="mono">${fmt(bid.fee)}</span></div>
+          <div class="tot"><span>Held</span><span class="mono">${fmt(bid.charge)}</span></div>
+        </div>
+        <div id="payslot" style="margin-top:var(--s4);min-height:80px"><div class="skel" style="height:46px"></div></div>
+        <div id="payerr"></div>
+        <button class="btn" id="paybtn" disabled>Preparing…</button>
+        <button class="btn btn-ghost" onclick="closeModal()">Not yet</button>
+      </div></div>`;
+    $('payslot').innerHTML = '';
+    const confirmFn = await mountPayment(a.clientSecret, 'payslot');
+    $('paybtn').disabled = false; $('paybtn').textContent = `Hold ${fmt(bid.charge)} and book`;
+    $('paybtn').onclick = async () => {
+      $('paybtn').disabled = true; $('paybtn').textContent = 'Authorizing…';
+      try {
+        await confirmFn();
+        const r = await api('POST', `/api/jobs/${S.job.id}/authorized`, {});
+        S.lastRouting = r.routing;
+        closeModal(); await loadJob(S.job.id); await refresh();
+        S.chat = [{ me: false, text: `Hi — got your ${S.job.service.toLowerCase()} job. I'll set off shortly.` }];
+        go('track'); toast(`${esc(bid.provider_name.split(' ')[0])} is booked. ${fmt(bid.charge)} held, not charged.`);
+      } catch (err) {
+        $('payerr').innerHTML = `<div class="note bad"><b>${esc(err.message)}</b><br>Your job is still open — try another card or another bid.</div>`;
+        $('paybtn').disabled = false; $('paybtn').textContent = `Hold ${fmt(bid.charge)} and book`;
+      }
+    };
+  } catch (e) { S.error = e.message; }
+  S.busy = false; render();
+}
+
+async function advance() {
+  S.busy = true; render();
+  try {
+    const r = await api('POST', `/api/jobs/${S.job.id}/advance`, {});
+    await loadJob(S.job.id); await refresh(); S.busy = false;
+    if (r.state === 'EN_ROUTE') {
+      S.chat.push({ me: false, text: 'On my way now, about 20 minutes out.' });
+      clearInterval(S.iv);
+      S.iv = setInterval(() => {
+        if (S.job?.state !== 'EN_ROUTE') return clearInterval(S.iv);
+        S.van.x += (70 - S.van.x) * .3; S.van.y += (26 - S.van.y) * .3;
+        S.pings++; S.eta = Math.max(1, S.eta - 2);
+        if (S.screen === 'track') render();
+      }, 1200);
+    }
+    if (r.state === 'ARRIVED') { S.van = { x: 70, y: 26 }; S.eta = 0; S.chat.push({ me: false, text: "Outside now — I'll knock." }); }
+    if (r.state === 'COMPLETED') { clearInterval(S.iv); return go('review'); }
+    render(); say(STATE_LABEL[r.state]);
+  } catch (e) { S.busy = false; toast(e.message); render(); }
+}
+
+function askCancel() {
+  const t = tier(S.job.state), bid = acceptedBid();
+  const charged = S.job.state === 'SCHEDULED' ? 0 : S.job.state === 'EN_ROUTE' ? (S.config.penalty ?? 3000) : bid.charge;
+  $('modal').innerHTML = `
+  <div class="veil"><div class="sheet" role="alertdialog" aria-modal="true" aria-label="Confirm cancellation">
+    <div class="grab"></div>
+    <h2>${charged === 0 ? 'Cancel this job?' : 'Are you sure?'}</h2>
+    <p class="sub">${t.detail}</p>
+    <div class="breakdown">
+      <div><span>Held on your card</span><span class="mono">${fmt(bid.charge)}</span></div>
+      <div><span>You'll be charged</span><span class="mono ${charged ? 'neg' : ''}">${fmt(charged)}</span></div>
+      <div class="tot"><span>Released</span><span class="mono pos">${fmt(bid.charge - charged)}</span></div>
+    </div>
+    <button class="btn ${charged ? 'btn-danger' : ''}" onclick="confirmCancel()">
+      ${charged ? 'Yes, cancel anyway' : 'Cancel and release the hold'}</button>
+    <button class="btn btn-ghost" onclick="closeModal()">Go back</button>
+  </div></div>`;
+}
+async function confirmCancel() {
+  try {
+    const r = await api('POST', `/api/jobs/${S.job.id}/cancel`, {});
+    clearInterval(S.iv); closeModal(); await refresh(); S.job = null; go('jobs');
+    toast(r.charged ? `Cancelled. ${fmt(r.charged)} charged.` : 'Cancelled. Nothing was charged.');
+  } catch (e) { toast(e.message); }
+}
+async function providerCancel() {
+  try {
+    const r = await api('POST', `/api/jobs/${S.job.id}/provider-cancel`, {});
+    clearInterval(S.iv); await refresh(); S.job = null; go('jobs');
+    toast(`Provider cancelled. ${fmt(r.compensation)} added to your wallet.`);
+  } catch (e) { toast(e.message); }
+}
+async function finish() {
+  S.busy = true; render();
+  try {
+    if (S.tip > 0) await api('POST', `/api/jobs/${S.job.id}/tip`, { amount: S.tip });
+    await refresh(); S.busy = false; S.job = null; S.rating = 0;
+    const tipped = S.tip; S.tip = 0; go('jobs');
+    toast(tipped ? `Review posted and ${fmt(tipped)} tipped.` : 'Review posted. Thanks.');
+  } catch (e) { S.busy = false; toast(e.message); render(); }
+}
+function sendMsg() {
+  const el = $('msg'), t = el.value.trim(); if (!t) return;
+  S.chat.push({ me: true, text: t }); el.value = ''; render();
+  setTimeout(() => {
+    S.chat.push({ me: false, text: S.job?.state === 'EN_ROUTE' ? "Traffic's light, still on track." : "Sure — I'll take a look." });
+    if (S.screen === 'track') render();
+  }, 1100);
+}
+async function openJob(id) {
+  await loadJob(id);
+  go(S.job.state === 'OPEN_FOR_BIDS' ? 'bids' : S.job.state === 'COMPLETED' ? 'jobs' : 'track');
+}
+
+/* ----------------------------------------------------------------- shell */
+function go(s) { S.screen = s; render(); window.scrollTo(0, 0); }
+function renderSafely(fn) {
+  try { return fn(); }
+  catch (err) {
+    console.error('render failed', err);
+    return `<div class="screen"><div class="empty"><h3>Something went wrong</h3>
+      <p class="sub">We couldn't draw this screen. Your money is unaffected.</p>
+      <button class="btn btn-ghost" onclick="go('home')">Back to home</button></div></div>`;
+  }
+}
+
+function render() {
+  if (!USER) {                      // signed out: no wallet strip, no tab bar
+    $('strip').hidden = true; $('nav').hidden = true;
+    $('view').innerHTML = renderSafely(V.login);
+    return;
+  }
+  $('view').innerHTML = S.loading
+    ? `<div class="screen"><div class="skel" style="height:26px;width:70%"></div>
+       <div class="skel" style="height:12px;width:50%;margin-top:12px"></div></div>`
+    : renderSafely(V[S.screen] || V.home);
+  $('nav').hidden = S.loading;
+  $('nav').innerHTML = [['home', 'Home', 'Home'], ['jobs', 'Jobs', 'Jobs'], ['wallet', 'Wallet', 'Wallet']]
+    .map(([k, l, ic]) => `<button aria-current="${S.screen === k || (k === 'jobs' && ['bids', 'track', 'review'].includes(S.screen))}"
+      onclick="go('${k}')">${icon(ic)}<span>${l}</span></button>`).join('');
+  renderStrip();
+  const c = $('chat'); if (c) c.scrollTop = c.scrollHeight;
+}
+
+Object.assign(window, { go, pick, openTopup, closeModal, submitJob, acceptBid, advance,
+  askCancel, confirmCancel, providerCancel, finish, sendMsg, openJob, withdraw, hint, S });
+
+(async function boot() {
+  try {
+    S.config = await api('GET', '/api/config');
+    if (USER) await refresh(); else S.loading = false;
+  } catch (e) { S.loading = false; toast('Could not reach Swoop. Is the server running?'); }
+  render();
+})();
