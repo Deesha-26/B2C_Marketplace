@@ -79,6 +79,37 @@ process.env.HYPERSWITCH_PAYMENT_RESPONSE_HASH_KEY
   : warn('HYPERSWITCH_PAYMENT_RESPONSE_HASH_KEY is empty — webhooks will be refused');
 if (!KEY) { console.log('\nCannot continue without a secret key.\n'); process.exit(1); }
 
+/* --- 0b. what the business profile actually has switched on --- */
+const MERCHANT = process.env.HYPERSWITCH_MERCHANT_ID;
+if (MERCHANT && PROFILE) {
+  step('0b. Business profile settings');
+  const prof = await call('GET', `/account/${MERCHANT}/business_profile/${PROFILE}`);
+  if (!prof.ok) {
+    warn(`could not read the profile (${prof.status}) — check HYPERSWITCH_MERCHANT_ID`);
+  } else {
+    // Field names vary by version, so surface anything relevant rather than
+    // guessing at exact keys.
+    const interesting = Object.entries(prof.json)
+      .filter(([k]) => /retr|extend|capture|block|overcapture/i.test(k));
+    if (interesting.length === 0) {
+      warn('the profile returned no retry/capture settings to report');
+    }
+    for (const [k, v] of interesting) {
+      const val = v === null || v === undefined ? '—' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+      console.log(`  ${C.dim}${k}: ${val}${C.off}`);
+    }
+    const retries = prof.json.is_auto_retries_enabled ?? prof.json.auto_retries_enabled;
+    if (retries === true) pass('auto retries are enabled — rerouting is possible');
+    else if (retries === false) warn('auto retries are OFF — step 7 cannot produce a second attempt');
+
+    const blocked = prof.json.payment_method_blocking ?? prof.json.blocked_payment_methods;
+    if (blocked && JSON.stringify(blocked) !== '{}') {
+      warn(`payment method blocking is configured: ${JSON.stringify(blocked)}`);
+      warn('Blocking feeds connector eligibility, which is the same machinery routing uses.');
+    }
+  }
+}
+
 /* --- 1. auto-capture (wallet top-up) --- */
 step('1. Wallet top-up — auto capture');
 const topup = await call('POST', '/payments', paymentBody(2500, { capture_method: 'automatic' }));
@@ -158,18 +189,47 @@ if (topupId) {
 
 /* --- 7. routing and retries --- */
 step('7. Routing and retries');
-const declined = await call('POST', '/payments', paymentBody(4200, { capture_method: 'automatic' }, DECLINE_CARD));
-const attempts = declined.json.attempts ?? [];
-console.log(`  ${C.dim}status: ${declined.json.status} · error: ${declined.json.error_code ?? '—'}${C.off}`);
-if (attempts.length > 1) {
-  pass(`Hyperswitch retried across ${attempts.length} attempts:`);
-  attempts.forEach((a, i) => console.log(`        ${i + 1}. ${a.connector} → ${a.status}${a.error_code ? ` (${a.error_code})` : ''}`));
-} else if (attempts.length === 1) {
-  warn(`single attempt via ${attempts[0].connector} — no retry`);
-  warn('4000 0000 0000 9995 maps to insufficient_funds, which is a hard decline by default.');
-  warn('For rerouting, either map it retryable in your GSM config, or use a soft-decline card.');
+
+/**
+ * Hyperswitch's own onboarding demonstrates this by routing to PayPal first:
+ * PayPal cannot process a raw card number, that connector-level failure is
+ * retryable, and Hyperswitch falls through to Stripe.
+ *
+ * The app never names a connector — routing is a dashboard concern. This
+ * diagnostic names one deliberately, purely to prove the retry path works.
+ */
+const routed = await call('POST', '/payments', {
+  ...paymentBody(4200, { capture_method: 'automatic' }, DECLINE_CARD),
+  routing: { type: 'priority', data: [{ connector: 'paypal' }, { connector: 'stripe' }] },
+});
+
+let trail = routed.ok ? (routed.json.attempts ?? []) : [];
+if (routed.ok && trail.length < 2) {
+  const full = await call('GET', `/payments/${routed.json.payment_id}?force_sync=true&expand_attempts=true`);
+  if (full.ok && Array.isArray(full.json.attempts)) trail = full.json.attempts;
+}
+
+console.log(`  ${C.dim}status: ${routed.ok ? routed.json.status : 'HTTP ' + routed.status}${C.off}`);
+if (trail.length > 1) {
+  pass(`Hyperswitch retried across ${trail.length} attempts:`);
+  trail.forEach((a, i) => console.log(`        ${i + 1}. ${a.connector} → ${a.status}${a.error_code ? ` (${a.error_code})` : ''}`));
+} else if (trail.length === 1) {
+  warn(`single attempt via ${trail[0].connector} — no retry happened`);
+  warn('For the two-attempt trail, PayPal must sit ahead of Stripe in your routing');
+  warn('order, and smart retry must be enabled on the merchant account.');
 } else {
-  warn('no attempts array returned — enable "expand_attempts" or check the payment in the dashboard');
+  warn('no attempts array returned — check Payment Operations in the dashboard');
+}
+
+/* An unrouted control, so a single attempt above is distinguishable from a
+   connector that simply ignores routing. */
+const unrouted = await call('POST', '/payments', paymentBody(4200, { capture_method: 'automatic' }, DECLINE_CARD));
+if (unrouted.ok) {
+  const n = (unrouted.json.attempts ?? []).length;
+  console.log(`  ${C.dim}control, no routing directive: ${unrouted.json.status} in ${n} attempt(s)${C.off}`);
+  if (unrouted.json.status === 'succeeded') {
+    warn('The decline card succeeded — this connector does not emulate issuer declines.');
+  }
 }
 
 /* --- 8. retrieve with attempts --- */
