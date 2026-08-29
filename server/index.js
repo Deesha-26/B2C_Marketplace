@@ -1,516 +1,510 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 
-import { open, now, uid } from './db.js';
-import { economics, WALLET_FLOOR, MIN_TOPUP, PENALTY, fmt } from './money.js';
+import { open, now, uid } from './db/index.js';
+import { economics, PENALTY, WALLET_FLOOR, MIN_TOPUP, CUSTOMER_FEE, LEAD_FEE, fmt } from './money.js';
 import {
-  Ledger, debit, credit, GATEWAY_SETTLED, AUTH_RECEIVABLE, ESCROW,
-  PLATFORM_REVENUE, REFUND_IN_TRANSIT, PROVIDER_CLAWBACK,
-  customerWallet, providerWallet,
-} from './ledger.js';
+  Ledger, jobCompleted, cancelledPreTravel, cancelledEnRoute, tip as tipPosting,
+  simulatedWithdrawal, customerWallet, isSimulated,
+} from './ledger/index.js';
 import * as hs from './hyperswitch.js';
-import { assess } from './intelligence/risk.js';
-import { topupRequest, authorizeRequest } from './intelligence/strategy.js';
-import { planCancellation, planCompletion, planProviderCancellation } from './intelligence/settlement.js';
-import { verifySignature, claimEvent, apply } from './webhooks.js';
-import { AuthWatchdog } from './watchdog.js';
+import { PaymentFlow } from './payments/flow.js';
+import * as ops from './payments/operations.js';
+import { jobPaymentKey, walletTopUpKey } from './payments/ids.js';
+import { verifySignature, claimEvent, isRegression } from './webhooks.js';
+import { STATES, nextState, cancellationTier, cancellationPreview,
+         SEED_PROVIDERS, bidAmountFor } from './jobs.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = open(process.env.DB_PATH || 'swoop.db');
+const db = await open();
 const ledger = new Ledger(db);
+const flow = new PaymentFlow(db, hs);
 const app = express();
 
-/* The webhook route needs the RAW body to verify the HMAC, so it is registered
-   before the JSON parser and given its own raw parser. */
-app.post('/api/webhooks/hyperswitch', express.raw({ type: '*/*' }), (req, res) => {
+/* ===========================================================================
+   Webhook — registered BEFORE the JSON parser.
+   Signature verification needs the exact bytes; a parsed-and-reserialised body
+   produces a different HMAC and every webhook would 401.
+   =========================================================================== */
+app.post('/api/webhooks/hyperswitch', express.raw({ type: '*/*' }), async (req, res) => {
   const raw = req.body.toString('utf8');
-  const ok = verifySignature(raw, req.get('x-webhook-signature-512'), process.env.HYPERSWITCH_PAYMENT_RESPONSE_HASH_KEY);
+  let ok;
+  try {
+    ok = verifySignature(raw, req.get('x-webhook-signature-512'),
+      process.env.HYPERSWITCH_PAYMENT_RESPONSE_HASH_KEY);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
   if (!ok) return res.status(401).json({ error: 'bad signature' });
 
-  const event = JSON.parse(raw);
-  const eventId = event.event_id || event.id;
+  let event;
+  try { event = JSON.parse(raw); } catch { return res.status(400).json({ error: 'unparsable body' }); }
+  const eventId = event.event_id ?? event.id;
   if (!eventId) return res.status(400).json({ error: 'missing event_id' });
 
-  // Claim and apply in one transaction: a duplicate delivery collides on the
-  // primary key and rolls back without touching the ledger.
-  db.exec('BEGIN');
+  const paymentId = event.content?.object?.payment_id ?? event.data?.object?.payment_id;
+
   try {
-    if (!claimEvent(db, eventId, event.event_type, event.content?.object?.payment_id)) {
-      db.exec('ROLLBACK');
-      return res.status(200).json({ status: 'duplicate ignored' });
+    // Retrieve BEFORE opening a transaction — never hold a pooled connection
+    // across a network call.
+    const operation = paymentId ? await ops.getByPaymentId(db, paymentId) : null;
+    let retrieved = null;
+    if (operation) {
+      const outcome = await flow.retrieveOutcome(paymentId);
+      if (outcome.kind === 'unknown') {
+        // Cannot verify. Do not claim the event, so Hyperswitch retries.
+        return res.status(503).json({ status: 'retry', reason: 'retrieval failed' });
+      }
+      retrieved = outcome.payment ?? null;
     }
-    const result = apply(db, event);
-    settleFromWebhook(event, result);
-    db.exec('COMMIT');
-    // 2xx as soon as it is durably stored. Slow handlers get retried.
-    res.status(200).json({ status: 'ok', result });
+
+    const result = await db.transaction(async t => {
+      if (!await claimEvent(t, eventId, event.event_type, paymentId)) {
+        return { duplicate: true };
+      }
+      if (!operation || !retrieved) return { ignored: 'no matching operation' };
+
+      const locked = await t.one(
+        'SELECT * FROM payments WHERE payment_id = $1 FOR UPDATE', [paymentId]);
+      if (locked && isRegression(locked.last_observed_external_status, retrieved.status)) {
+        return { ignored: `late ${event.event_type} after ${locked.last_observed_external_status}` };
+      }
+      // Claim and effects commit together; a failure rolls back both.
+      return flow.applyVerified(operation, retrieved, t);
+    });
+
+    if (result.duplicate) return res.status(200).json({ status: 'duplicate ignored' });
+    return res.status(200).json({ status: 'ok', result });
   } catch (err) {
-    db.exec('ROLLBACK');
     console.error('webhook', err);
-    res.status(500).json({ error: 'processing failed' });
+    // Rolled back, including the event claim, so the retry is processed.
+    return res.status(500).json({ error: 'processing failed' });
   }
 });
-
-/**
- * Webhooks are the durable path for money, not just a status feed. If the
- * browser is closed after paying, this is the only thing that credits the
- * wallet — so the ledger posting happens here, inside the same transaction that
- * claimed the event id.
- */
-function settleFromWebhook(event, result) {
-  const type = event.event_type || event.type;
-  const data = event.content?.object || event.data?.object || {};
-
-  if (type === 'payment_succeeded' || type === 'payment_captured') {
-    const row = db.prepare('SELECT * FROM payments WHERE payment_id = ?').get(data.payment_id);
-    if (!row || row.purpose !== 'wallet_topup') return;
-    const key = `topup:${row.payment_id}:credit`;
-    if (db.prepare('SELECT 1 FROM idempotency WHERE key = ?').get(key)) return;
-    ledger.post({ userId: row.user_id, reason: 'WALLET_TOPUP', gatewayRef: row.payment_id,
-      inTransaction: true,
-      entries: [debit(GATEWAY_SETTLED, row.amount), credit(customerWallet(row.user_id), row.amount)] });
-    db.prepare('INSERT INTO idempotency (key,result,created_at) VALUES (?,?,?)')
-      .run(key, JSON.stringify({ credited: row.amount }), now());
-  }
-
-  if (type === 'refund_succeeded') {
-    const r = db.prepare('SELECT * FROM refunds WHERE refund_id = ?').get(data.refund_id);
-    if (!r) return;
-    const key = `refund:${r.refund_id}:settle`;
-    if (db.prepare('SELECT 1 FROM idempotency WHERE key = ?').get(key)) return;
-    // Clears REFUND_IN_TRANSIT, which withdrawal opens and nothing else closed.
-    ledger.post({ reason: 'REFUND_SETTLED', gatewayRef: r.refund_id, inTransaction: true,
-      entries: [debit(REFUND_IN_TRANSIT, r.amount), credit(GATEWAY_SETTLED, r.amount)] });
-    db.prepare('INSERT INTO idempotency (key,result,created_at) VALUES (?,?,?)')
-      .run(key, JSON.stringify({ settled: r.amount }), now());
-  }
-}
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-/* ---- demo auth: a header, not a real session. Replace before production. ---- */
-const userOf = req => {
-  const id = req.get('x-swoop-user') || 'usr_demo';
-  let u = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+/* ---------------------------------------------------------------- identity */
+/**
+ * Round 1 identity: an unguessable UUID generated in the browser on first visit.
+ * Not authentication — there is no session, token or password. Deferred.
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+async function userOf(req) {
+  const id = req.get('x-swoop-user');
+  if (!id || !UUID_RE.test(id)) {
+    const e = new Error('A valid x-swoop-user UUID is required.');
+    e.status = 401; throw e;
+  }
+  let u = await db.one('SELECT * FROM users WHERE id = $1', [id]);
   if (!u) {
-    db.prepare('INSERT INTO users (id,email,name,created_at) VALUES (?,?,?,?)')
-      .run(id, `${id}@example.com`, 'Alex', now());
-    u = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+    await db.none('INSERT INTO users (id, display_email) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [id, req.get('x-swoop-email') ?? null]);
+    u = await db.one('SELECT * FROM users WHERE id = $1', [id]);
   }
   return u;
-};
-/** 404s cleanly instead of letting undefined propagate into a 500. */
-class NotFound extends Error { constructor(m='not found'){ super(m); this.status = 404; } }
-class Conflict extends Error { constructor(m){ super(m); this.status = 409; } }
-
-function mustJob(req) {
-  const u = userOf(req);
-  const job = db.prepare('SELECT * FROM jobs WHERE id=? AND user_id=?').get(req.params.id, u.id);
-  if (!job) throw new NotFound('Job not found.');
-  return { u, job };
-}
-function mustAcceptedBid(job) {
-  if (!job.accepted_bid_id) throw new Conflict('That job has no accepted bid.');
-  const bid = db.prepare('SELECT * FROM bids WHERE id=?').get(job.accepted_bid_id);
-  if (!bid) throw new NotFound('Accepted bid not found.');
-  return bid;
-}
-function mustHold(job) {
-  const row = db.prepare("SELECT * FROM payments WHERE job_id=? AND purpose='job_authorization'").get(job.id);
-  if (!row) throw new Conflict('That job has no authorization.');
-  return row;
-}
-
-/**
- * Keeps the local payments row in step with the gateway after every capture or
- * void. Without this the table keeps reporting a settled hold as outstanding
- * and reconciliation silently drifts.
- */
-function syncPayment(paymentId, gatewayResponse) {
-  db.prepare(`UPDATE payments SET status=?, amount_captured=?, connector=?, attempts=?,
-                capture_by=?, updated_at=? WHERE payment_id=?`)
-    .run(gatewayResponse.status,
-         gatewayResponse.amount_captured ?? 0,
-         gatewayResponse.connector ?? null,
-         JSON.stringify(gatewayResponse.attempts ?? []),
-         hs.captureDeadline(gatewayResponse),
-         now(), paymentId);
 }
 
 const wrap = fn => (req, res) => fn(req, res).catch(err => {
-  console.error(err);
+  if (!err.status) console.error(err);
   res.status(err.status || 500).json({ error: err.message, code: err.code });
 });
+const fail = (status, message) => { const e = new Error(message); e.status = status; throw e; };
 
-/* Derived idempotency: a retry of the same logical operation reuses the key,
-   so a double-tap cannot create a second authorization. */
-function onceOnly(key, fn) {
-  const hit = db.prepare('SELECT result FROM idempotency WHERE key = ?').get(key);
-  if (hit) return JSON.parse(hit.result);
-  const result = fn();
-  db.prepare('INSERT INTO idempotency (key,result,created_at) VALUES (?,?,?)')
-    .run(key, JSON.stringify(result), now());
-  return result;
+async function mustJob(req, user) {
+  const job = await db.one('SELECT * FROM jobs WHERE id = $1 AND user_id = $2',
+    [req.params.id, user.id]);
+  if (!job) fail(404, 'Job not found.');
+  return job;
 }
+const acceptedBid = job => job.accepted_bid_id
+  ? db.one('SELECT * FROM bids WHERE id = $1', [job.accepted_bid_id])
+  : null;
 
-/* ---------------------------------------------------------------- config ---- */
+const walletOf = userId => ledger.balance(customerWallet(userId));
+
+/* ============================================================ 1. config === */
 app.get('/api/config', (req, res) => res.json({
   publishableKey: hs.publishableKey(),
-  walletFloor: WALLET_FLOOR, minTopup: MIN_TOPUP, penalty: PENALTY,
+  walletFloor: WALLET_FLOOR,
+  minTopUp: MIN_TOPUP,
+  travelCompensation: PENALTY,
+  customerFeeRate: CUSTOMER_FEE,
+  providerLeadFeeRate: LEAD_FEE,
+  // Round 1 captures at approval and reserves internally. The UI must say so.
+  settlement: 'captured_and_reserved',
 }));
 
-/* ------------------------------------------------------------------ me ------ */
-/**
- * How much of the wallet can actually be returned to a card.
- *
- * A refund must reverse a real payment, so compensation credited by a provider
- * cancellation has no payment behind it and cannot be withdrawn. Wallet balance
- * and withdrawable capacity are therefore different numbers, and the UI has to
- * show the smaller one.
- */
-function withdrawable(userId) {
-  const r = db.prepare(`SELECT COALESCE(SUM(amount - amount_refunded),0) AS t FROM payments
-                        WHERE user_id=? AND purpose='wallet_topup' AND status='succeeded'`).get(userId);
-  return Math.max(0, Math.min(ledger.walletOf(userId), Number(r.t)));
-}
-
+/* ================================================================ 2. me === */
 app.get('/api/me', wrap(async (req, res) => {
-  const u = userOf(req);
-  const bal = ledger.walletOf(u.id);
+  const u = await userOf(req);
+  const balance = await walletOf(u.id);
+  const activity = await ledger.activity(u.id, 50);
   res.json({
-    user: { id: u.id, name: u.name, email: u.email },
-    wallet: bal,
-    withdrawable: withdrawable(u.id),
-    canBook: bal >= WALLET_FLOOR,
-    activity: ledger.history(u.id, 50),
+    user: { id: u.id, email: u.display_email },
+    wallet: balance,
+    // Every Round 1 wallet cent traces to a captured payment, so the whole
+    // balance is withdrawable. Withdrawal itself is simulated.
+    withdrawable: balance,
+    canBook: balance >= WALLET_FLOOR,
+    activity: activity.map(a => ({
+      id: a.id, reason: a.reason, jobId: a.job_id, paymentId: a.payment_id,
+      walletDelta: Number(a.wallet_delta), at: a.created_at,
+      simulated: isSimulated({ metadata: a.metadata }),
+    })),
   });
 }));
 
-app.get('/api/cards', wrap(async (req, res) => {
-  const u = userOf(req);
-  try {
-    const list = await hs.listSavedCards(u.id);
-    res.json(list.customer_payment_methods ?? []);
-  } catch {
-    res.json([]);   // no vaulted cards yet is not an error
-  }
-}));
-
-/* ------------------------------------------------------- wallet top-up ------ */
+/* ====================================================== 3. wallet top-up == */
 app.post('/api/wallet/topup', wrap(async (req, res) => {
-  const u = userOf(req);
+  const u = await userOf(req);
   const amount = Number(req.body.amount);
+  const requestId = String(req.body.requestId ?? '').trim();
   if (!Number.isInteger(amount) || amount < MIN_TOPUP) {
-    return res.status(400).json({ error: `Minimum top-up is ${fmt(MIN_TOPUP)}.` });
+    fail(400, `Minimum top-up is ${fmt(MIN_TOPUP)}.`);
   }
-  const body = topupRequest({
-    user: u, amount,
-    saveCard: !!req.body.saveCard,
-    savedPaymentMethodId: req.body.paymentMethodId,
+  // Keyed per request, not per user: a customer may top up more than once.
+  if (!requestId) fail(400, 'requestId is required so repeated taps cannot create two payments.');
+
+  const started = await flow.start({
+    operationKey: walletTopUpKey(u.id, requestId),
+    kind: 'wallet_topup', userId: u.id, purpose: 'wallet_topup',
+    amount, currency: 'USD',
+  }, paymentId => ({
+    payment_id: paymentId, amount, currency: 'USD',
+    capture_method: 'automatic',          // the only path Diagnostic B verified
+    authentication_type: 'no_three_ds',   // 3DS completion is unverified
+    confirm: false,                       // the SDK confirms in the browser
+    customer_id: u.id,
+    description: 'Swoop wallet top-up',
+    metadata: { swoop_user_id: u.id, purpose: 'wallet_topup' },
+  }));
+
+  res.json({
+    paymentId: started.paymentId,
+    clientSecret: started.payment?.client_secret ?? null,
+    alreadyStarted: started.status === 'existing',
   });
-  const payment = await hs.createPayment(body, `topup:${u.id}:${Date.now()}`);
-  db.prepare(`INSERT INTO payments (payment_id,user_id,purpose,amount,status,capture_method,
-                client_secret,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(payment.payment_id, u.id, 'wallet_topup', amount, payment.status, 'automatic',
-         payment.client_secret, now(), now());
-  // The browser gets the client_secret only — never the secret key.
-  res.json({ paymentId: payment.payment_id, clientSecret: payment.client_secret });
 }));
 
-/* Called by the client after the SDK reports success. The ledger credit is
-   idempotent, so a webhook arriving first or second is harmless. */
-app.post('/api/wallet/topup/:id/settle', wrap(async (req, res) => {
-  const u = userOf(req);
-  const payment = await hs.retrievePayment(req.params.id);
-  const row = db.prepare('SELECT * FROM payments WHERE payment_id = ? AND user_id = ?')
-    .get(req.params.id, u.id);
-  if (!row) return res.status(404).json({ error: 'unknown payment' });
-
-  const trail = hs.routingTrail(payment);
-  syncPayment(row.payment_id, payment);
-
-  if (payment.status === 'succeeded') {
-    onceOnly(`topup:${row.payment_id}:credit`, () => {
-      ledger.post({ userId: u.id, reason: 'WALLET_TOPUP', gatewayRef: row.payment_id,
-        entries: [debit(GATEWAY_SETTLED, row.amount), credit(customerWallet(u.id), row.amount)] });
-      return { credited: row.amount };
-    });
-  }
-  res.json({ status: payment.status, wallet: ledger.walletOf(u.id), routing: trail });
+/* ============================================ 4. wallet top-up reconcile == */
+app.post('/api/wallet/topup/:requestId/reconcile', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const result = await flow.reconcile({
+    operationKey: walletTopUpKey(u.id, req.params.requestId),
+    requestingUserId: u.id,
+  });
+  if (result.status === 'forbidden') fail(403, 'That operation belongs to another account.');
+  res.json({ ...result, wallet: await walletOf(u.id) });
 }));
 
-/* -------------------------------------------------------------- jobs -------- */
-const PROVIDERS = [
-  { id: 'prov_1', name: 'Ravi Ganesan', trade: 'Ganesan Plumbing', rating: 4.9, jobs: 412, mins: 22, base: 9000,
-    note: 'Includes replacing the cartridge and testing for further leaks.' },
-  { id: 'prov_2', name: 'Dana Whitlock', trade: 'Whitlock & Sons', rating: 4.7, jobs: 188, mins: 35, base: 7500,
-    note: 'Callout plus one hour of labour. Parts billed separately if needed.' },
-  { id: 'prov_3', name: 'Marcus Oyelaran', trade: 'Bayline Mechanical', rating: 5.0, jobs: 96, mins: 14, base: 12500,
-    note: 'Same-day, fully insured, 12-month workmanship guarantee.' },
-];
-
+/* ============================================================== 5. jobs === */
 app.post('/api/jobs', wrap(async (req, res) => {
-  const u = userOf(req);
-  if (ledger.walletOf(u.id) < WALLET_FLOOR) {
-    return res.status(402).json({ error: `Keep at least ${fmt(WALLET_FLOOR)} in your wallet to book.` });
+  const u = await userOf(req);
+  if (await walletOf(u.id) < WALLET_FLOOR) {
+    fail(402, `Keep at least ${fmt(WALLET_FLOOR)} in your Swoop wallet to book.`);
   }
   const { service, description, address, scheduledFor, isEmergency } = req.body;
-  if (!description || description.length < 8) return res.status(400).json({ error: 'Describe the job in a sentence or two.' });
+  if (!service) fail(400, 'Choose a service.');
+  if (!description || description.trim().length < 8) fail(400, 'Describe the job in a sentence or two.');
+  if (!address) fail(400, 'Enter the job location.');
+  if (!scheduledFor || Number.isNaN(Date.parse(scheduledFor))) fail(400, 'Choose a date and time.');
 
-  const id = uid('job');
-  db.prepare(`INSERT INTO jobs (id,user_id,service,description,address,scheduled_for,is_emergency,state,created_at)
-              VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(id, u.id, service, description, address, scheduledFor, isEmergency ? 1 : 0, 'OPEN_FOR_BIDS', now());
-
-  // Stand-in for real providers bidding.
-  const expires = new Date(Date.now() + 2 * 3600 * 1000).toISOString();
-  for (const p of PROVIDERS) {
-    db.prepare(`INSERT INTO bids (id,job_id,provider_id,provider_name,trade,rating,jobs_done,
-                  eta_minutes,amount,note,placed_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(uid('bid'), id, p.id, p.name, p.trade, p.rating, p.jobs, p.mins,
-           isEmergency ? Math.round(p.base * 1.2) : p.base, p.note, now(), expires);
-  }
-  res.json({ id });
-}));
-
-app.get('/api/jobs', wrap(async (req, res) => {
-  const u = userOf(req);
-  res.json(db.prepare('SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC').all(u.id));
-}));
-
-app.get('/api/jobs/:id', wrap(async (req, res) => {
-  const u = userOf(req);
-  const job = db.prepare('SELECT * FROM jobs WHERE id=? AND user_id=?').get(req.params.id, u.id);
-  if (!job) return res.status(404).json({ error: 'not found' });
-  const live = db.prepare('SELECT * FROM bids WHERE job_id=? AND expires_at > ? ORDER BY amount')
-    .all(job.id, now());
-  const payment = db.prepare("SELECT * FROM payments WHERE job_id=? AND purpose='job_authorization'").get(job.id);
-  res.json({
-    job,
-    bids: live.map(b => ({ ...b, ...economics(b.amount) })),
-    events: db.prepare('SELECT * FROM job_events WHERE job_id=? ORDER BY id').all(job.id),
-    payment: payment ? {
-      id: payment.payment_id, status: payment.status, amount: payment.amount,
-      captureBy: payment.capture_by, extendedAt: payment.extended_at,
-      routing: JSON.parse(payment.attempts || '[]'),
-    } : null,
-  });
-}));
-
-/* ---- accept a bid: authorize the exact bid + fee, no connector named ------- */
-app.post('/api/jobs/:id/accept', wrap(async (req, res) => {
-  const u = userOf(req);
-  const job = db.prepare('SELECT * FROM jobs WHERE id=? AND user_id=?').get(req.params.id, u.id);
-  if (!job) return res.status(404).json({ error: 'not found' });
-  if (job.state !== 'OPEN_FOR_BIDS') return res.status(409).json({ error: `Job is already ${job.state}.` });
-
-  const bid = db.prepare('SELECT * FROM bids WHERE id=? AND job_id=?').get(req.body.bidId, job.id);
-  if (!bid) return res.status(404).json({ error: 'bid not found' });
-  if (new Date(bid.expires_at) < new Date()) return res.status(410).json({ error: 'That bid has expired.' });
-
-  const history = {
-    completedJobs: db.prepare("SELECT COUNT(*) c FROM jobs WHERE user_id=? AND state='COMPLETED'").get(u.id).c,
-    providerClawback: ledger.raw(PROVIDER_CLAWBACK),
-  };
-  const risk = assess({ job, amount: economics(bid.amount).charge, history });
-  const { request, economics: e } = authorizeRequest({ user: u, job, bid, risk });
-
-  const payment = await hs.createPayment(request, `${job.id}:authorize`);
-  // Record the chosen bid now. Taking it from the client on the follow-up call
-  // let a missing field orphan the job with no accepted bid.
-  db.prepare('UPDATE jobs SET accepted_bid_id=? WHERE id=?').run(bid.id, job.id);
-  db.prepare(`INSERT INTO payments (payment_id,user_id,job_id,purpose,amount,status,capture_method,
-                capture_by,client_secret,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(payment.payment_id, u.id, job.id, 'job_authorization', e.charge, payment.status,
-         'manual', hs.captureDeadline(payment), payment.client_secret, now(), now());
-
-  res.json({
-    paymentId: payment.payment_id, clientSecret: payment.client_secret,
-    economics: e, risk: { level: risk.level, signals: risk.signals, extendedAuth: risk.needsExtendedAuth },
-  });
-}));
-
-/* Confirmed by the SDK — record the hold and move the job to SCHEDULED. */
-app.post('/api/jobs/:id/authorized', wrap(async (req, res) => {
-  const u = userOf(req);
-  const job = db.prepare('SELECT * FROM jobs WHERE id=? AND user_id=?').get(req.params.id, u.id);
-  if (!job) return res.status(404).json({ error: 'Job not found.' });
-  const row = mustHold(job);
-  const payment = await hs.retrievePayment(row.payment_id);
-
-  db.prepare('UPDATE payments SET status=?,connector=?,attempts=?,capture_by=?,updated_at=? WHERE payment_id=?')
-    .run(payment.status, payment.connector ?? null, JSON.stringify(payment.attempts ?? []),
-         hs.captureDeadline(payment), now(), row.payment_id);
-
-  if (payment.status !== 'requires_capture') {
-    return res.status(402).json({ status: payment.status, routing: hs.routingTrail(payment) });
-  }
-  onceOnly(`${job.id}:hold`, () => {
-    ledger.post({ userId: u.id, jobId: job.id, reason: 'JOB_AUTHORIZED', gatewayRef: row.payment_id,
-      entries: [debit(AUTH_RECEIVABLE, row.amount), credit(ESCROW, row.amount)] });
-    db.prepare('UPDATE jobs SET state=? WHERE id=?').run('SCHEDULED', job.id);
-    return { held: row.amount };
-  });
-  res.json({ status: 'SCHEDULED', routing: hs.routingTrail(payment), captureBy: hs.captureDeadline(payment) });
-}));
-
-/* ---- provider progress (stands in for the provider app) ------------------- */
-const NEXT = { SCHEDULED: 'EN_ROUTE', EN_ROUTE: 'ARRIVED', ARRIVED: 'IN_PROGRESS', IN_PROGRESS: 'COMPLETED' };
-
-app.post('/api/jobs/:id/advance', wrap(async (req, res) => {
-  const { u, job } = mustJob(req);
-  const next = NEXT[job.state];
-  if (!next) return res.status(409).json({ error: `Cannot advance from ${job.state}.` });
-
-  db.prepare('INSERT INTO job_events (job_id,kind,lat,lng,at) VALUES (?,?,?,?,?)')
-    .run(job.id, next, req.body.lat ?? null, req.body.lng ?? null, now());
-
-  if (next !== 'COMPLETED') {
-    db.prepare('UPDATE jobs SET state=? WHERE id=?').run(next, job.id);
-    return res.json({ state: next });
-  }
-  const bid = mustAcceptedBid(job);
-  const row = mustHold(job);
-  const plan = planCompletion(bid.amount);
-
-  syncPayment(row.payment_id, await hs.capturePayment(row.payment_id, plan.captureAmount, `${job.id}:capture`));
-  ledger.post({ userId: u.id, jobId: job.id, reason: 'JOB_CAPTURED', gatewayRef: row.payment_id,
-    entries: [debit(GATEWAY_SETTLED, plan.charged), credit(AUTH_RECEIVABLE, plan.charged)] });
-  ledger.post({ userId: u.id, jobId: job.id, reason: 'JOB_SETTLED', gatewayRef: row.payment_id,
-    entries: [debit(ESCROW, plan.charged), credit(providerWallet(bid.provider_id), plan.toProvider),
-              credit(PLATFORM_REVENUE, plan.toPlatform)] });
-  db.prepare('UPDATE jobs SET state=? WHERE id=?').run('COMPLETED', job.id);
-  res.json({ state: 'COMPLETED', charged: plan.charged, economics: plan.economics });
-}));
-
-/* ---- cancellation: void, partial capture, or full capture ----------------- */
-app.post('/api/jobs/:id/cancel', wrap(async (req, res) => {
-  const { u, job } = mustJob(req);
-  if (!planCancellation(job.state, 1)) return res.status(409).json({ error: `Cannot cancel a job that is ${job.state}.` });
-  const bid = mustAcceptedBid(job);
-  const row = mustHold(job);
-  const plan = planCancellation(job.state, bid.amount);
-
-  const e = plan.economics;
-  if (plan.operation === 'void') {
-    syncPayment(row.payment_id, await hs.voidPayment(row.payment_id, `${job.id}:void`));
-    ledger.post({ userId: u.id, jobId: job.id, reason: 'CANCELLED_PRE_ENROUTE', gatewayRef: row.payment_id,
-      entries: [debit(ESCROW, e.charge), credit(AUTH_RECEIVABLE, e.charge)] });
-  } else {
-    syncPayment(row.payment_id, await hs.capturePayment(row.payment_id, plan.captureAmount, `${job.id}:capture`));
-    ledger.post({ userId: u.id, jobId: job.id, reason: 'CANCEL_CAPTURE', gatewayRef: row.payment_id,
-      entries: [debit(GATEWAY_SETTLED, plan.charged), credit(AUTH_RECEIVABLE, plan.charged)] });
-    if (plan.released > 0) {
-      ledger.post({ userId: u.id, jobId: job.id, reason: 'CANCEL_VOID_REMAINDER', gatewayRef: row.payment_id,
-        entries: [debit(ESCROW, plan.released), credit(AUTH_RECEIVABLE, plan.released)] });
+  const jobId = uid('job');
+  await db.transaction(async t => {
+    await t.none(
+      `INSERT INTO jobs (id,user_id,service,description,address,scheduled_for,is_emergency,state)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [jobId, u.id, service, description.trim(), address, scheduledFor,
+       !!isEmergency, STATES.OPEN_FOR_BIDS]);
+    for (const p of SEED_PROVIDERS) {
+      await t.none(
+        `INSERT INTO bids (id,job_id,provider_id,provider_name,trade,rating,eta_minutes,amount,note)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [uid('bid'), jobId, p.providerId, p.name, p.trade, p.rating, p.etaMinutes,
+         bidAmountFor(p.base, isEmergency), p.note]);
     }
-    const out = [debit(ESCROW, plan.charged), credit(providerWallet(bid.provider_id), plan.toProvider)];
-    if (plan.toPlatform > 0) out.push(credit(PLATFORM_REVENUE, plan.toPlatform));
-    ledger.post({ userId: u.id, jobId: job.id, reason: 'CANCEL_SETTLE', gatewayRef: row.payment_id, entries: out });
-  }
-  db.prepare('UPDATE jobs SET state=? WHERE id=?').run('CANCELLED_BY_CUSTOMER', job.id);
-  res.json({ tier: plan.tier, charged: plan.charged, released: plan.released, summary: plan.summary });
-}));
-
-/* ---- provider pulls out: void the hold, pay the customer $30 -------------- */
-app.post('/api/jobs/:id/provider-cancel', wrap(async (req, res) => {
-  const { u, job } = mustJob(req);
-  if (job.state !== 'SCHEDULED') return res.status(409).json({ error: 'A provider cannot cancel once en route.' });
-  const bid = mustAcceptedBid(job);
-  const row = mustHold(job);
-  const plan = planProviderCancellation(bid.amount);
-
-  syncPayment(row.payment_id, await hs.voidPayment(row.payment_id, `${job.id}:void`));
-  ledger.post({ userId: u.id, jobId: job.id, reason: 'PROVIDER_CANCELLED', gatewayRef: row.payment_id,
-    entries: [debit(ESCROW, plan.economics.charge), credit(AUTH_RECEIVABLE, plan.economics.charge)] });
-
-  // Wallet-to-wallet. The provider's balance may go negative; that becomes a
-  // clawback that blocks their future withdrawals.
-  const bal = ledger.providerBalance(bid.provider_id);
-  const fromWallet = Math.max(0, Math.min(plan.compensation, bal));
-  const toClawback = plan.compensation - fromWallet;
-  const entries = [];
-  if (fromWallet > 0) entries.push(debit(providerWallet(bid.provider_id), fromWallet));
-  if (toClawback > 0) entries.push(debit(PROVIDER_CLAWBACK, toClawback));
-  entries.push(credit(customerWallet(u.id), plan.compensation));
-  ledger.post({ userId: u.id, jobId: job.id, reason: 'PROVIDER_PENALTY', entries });
-
-  db.prepare('UPDATE jobs SET state=? WHERE id=?').run('CANCELLED_BY_PROVIDER', job.id);
-  res.json({ compensation: plan.compensation, wallet: ledger.walletOf(u.id) });
-}));
-
-/* ---- tips: paid from the wallet, 100% to the provider --------------------- */
-app.post('/api/jobs/:id/tip', wrap(async (req, res) => {
-  const { u, job } = mustJob(req);
-  if (job.state !== 'COMPLETED') return res.status(409).json({ error: 'Tips are for completed jobs.' });
-  const bid = mustAcceptedBid(job);
-  const amount = Number(req.body.amount);
-  if (!Number.isInteger(amount) || amount <= 0) return res.status(400).json({ error: 'Invalid tip.' });
-  if (amount > ledger.walletOf(u.id)) return res.status(402).json({ error: 'That is more than your wallet holds.' });
-
-  onceOnly(`${job.id}:tip`, () => {
-    ledger.post({ userId: u.id, jobId: job.id, reason: 'TIP',
-      entries: [debit(customerWallet(u.id), amount), credit(providerWallet(bid.provider_id), amount)] });
-    return { amount };
   });
-  res.json({ wallet: ledger.walletOf(u.id) });
+  res.json({ id: jobId });
 }));
 
-/* ---- refunds: withdrawal, and job disputes upheld ------------------------- */
-app.post('/api/wallet/withdraw', wrap(async (req, res) => {
-  const u = userOf(req);
+/* ========================================================== 6. job read === */
+app.get('/api/jobs/:id', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const job = await mustJob(req, u);
+  const bids = await db.all('SELECT * FROM bids WHERE job_id = $1 ORDER BY amount', [job.id]);
+  const events = await db.all('SELECT * FROM job_events WHERE job_id = $1 ORDER BY id', [job.id]);
+  const approval = await db.one(
+    'SELECT * FROM approvals WHERE job_id = $1 ORDER BY approved_at DESC LIMIT 1', [job.id]);
+  const payment = await db.one(
+    "SELECT * FROM payments WHERE job_id = $1 AND purpose = 'job_payment'", [job.id]);
+  const bid = await acceptedBid(job);
+
+  res.json({
+    job: { ...job, cancellation: bid ? cancellationPreview(job.state, bid.amount) : null },
+    // Every bid carries the full breakdown the customer must approve.
+    bids: bids.map(b => {
+      const e = economics(b.amount);
+      return { ...b, bidAmount: e.bid, feeAmount: e.fee, totalAmount: e.charge };
+    }),
+    events,
+    approval,
+    payment: payment && {
+      paymentId: payment.payment_id,
+      reconciliationState: payment.reconciliation_state,
+      lastObservedExternalStatus: payment.last_observed_external_status,
+      discrepancyReason: payment.discrepancy_reason,
+    },
+  });
+}));
+
+/* ====================================================== 7. approve ======== */
+/**
+ * Customer consent to a specific total. NOT a processor authorization — nothing
+ * has been sent to Hyperswitch at this point. A price change creates a new
+ * approval row; the old one is never mutated.
+ */
+app.post('/api/jobs/:id/approve', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const job = await mustJob(req, u);
+  if (![STATES.OPEN_FOR_BIDS, STATES.APPROVED].includes(job.state)) {
+    fail(409, `This job is already ${job.state}.`);
+  }
+  const bid = await db.one('SELECT * FROM bids WHERE id = $1 AND job_id = $2',
+    [req.body.bidId, job.id]);
+  if (!bid) fail(404, 'That bid is not on this job.');
+
+  const e = economics(bid.amount);
+  const approvalId = uid('appr');
+  await db.transaction(async t => {
+    await t.none(
+      `INSERT INTO approvals (id,job_id,bid_id,bid_amount,fee_amount,total_amount,currency)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [approvalId, job.id, bid.id, e.bid, e.fee, e.charge, 'USD']);
+    await t.none('UPDATE jobs SET state = $2, accepted_bid_id = $3 WHERE id = $1',
+      [job.id, STATES.APPROVED, bid.id]);
+  });
+
+  res.json({
+    approvalId,
+    breakdown: { bidAmount: e.bid, feeAmount: e.fee, totalAmount: e.charge, currency: 'USD' },
+    provider: { id: bid.provider_id, name: bid.provider_name, trade: bid.trade },
+  });
+}));
+
+/* =========================================================== 8. pay ======= */
+app.post('/api/jobs/:id/pay', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const job = await mustJob(req, u);
+  if (job.state !== STATES.APPROVED) fail(409, `Approve a bid before paying (job is ${job.state}).`);
+
+  const approval = await db.one('SELECT * FROM approvals WHERE id = $1 AND job_id = $2',
+    [req.body.approvalId, job.id]);
+  if (!approval) fail(404, 'That approval does not belong to this job.');
+
+  const started = await flow.start({
+    operationKey: jobPaymentKey(job.id, approval.id),
+    kind: 'job_payment', userId: u.id, purpose: 'job_payment',
+    jobId: job.id, approvalId: approval.id,
+    amount: Number(approval.total_amount), currency: approval.currency,
+  }, paymentId => ({
+    payment_id: paymentId,
+    amount: Number(approval.total_amount), currency: approval.currency,
+    capture_method: 'automatic',
+    authentication_type: 'no_three_ds',
+    confirm: false,
+    customer_id: u.id,
+    description: `${job.service} — approved total`,
+    metadata: { swoop_user_id: u.id, swoop_job_id: job.id, swoop_approval_id: approval.id },
+  }));
+
+  res.json({
+    paymentId: started.paymentId,
+    clientSecret: started.payment?.client_secret ?? null,
+    alreadyStarted: started.status === 'existing',
+    approvedTotal: Number(approval.total_amount),
+  });
+}));
+
+/* ==================================================== 9. job reconcile ==== */
+app.post('/api/jobs/:id/reconcile', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const job = await mustJob(req, u);
+  const approval = await db.one(
+    'SELECT * FROM approvals WHERE job_id = $1 ORDER BY approved_at DESC LIMIT 1', [job.id]);
+  if (!approval) fail(409, 'This job has no approval to reconcile.');
+
+  const result = await flow.reconcile({
+    operationKey: jobPaymentKey(job.id, approval.id),
+    requestingUserId: u.id,
+  });
+  if (result.status === 'forbidden') fail(403, 'That operation belongs to another account.');
+
+  // Only verified external capture moves the job forward.
+  if (result.status === 'verified' && job.state === STATES.APPROVED) {
+    await db.none('UPDATE jobs SET state = $2 WHERE id = $1', [job.id, STATES.RESERVED]);
+  }
+  const after = await db.one('SELECT state FROM jobs WHERE id = $1', [job.id]);
+  res.json({ ...result, jobState: after.state });
+}));
+
+/* ================================================ 10. attempts (live) ==== */
+/**
+ * Live passthrough. The attempt trail belongs to Hyperswitch and is deliberately
+ * not stored: a copy could disagree with the source it is meant to evidence.
+ */
+app.get('/api/jobs/:id/attempts', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const job = await mustJob(req, u);
+  const payment = await db.one(
+    "SELECT payment_id FROM payments WHERE job_id = $1 AND purpose = 'job_payment'", [job.id]);
+  if (!payment) fail(404, 'No payment on this job yet.');
+
+  const retrieved = await hs.retrievePayment(payment.payment_id);
+  res.json({
+    paymentId: payment.payment_id,
+    finalStatus: retrieved.status,
+    attempts: hs.routingTrail(retrieved),
+  });
+}));
+
+/* ========================================================= 11. advance === */
+app.post('/api/jobs/:id/advance', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const job = await mustJob(req, u);
+  const next = nextState(job.state);
+  if (!next) fail(409, `Cannot advance a job that is ${job.state}.`);
+
+  await db.transaction(async t => {
+    await t.none('UPDATE jobs SET state = $2 WHERE id = $1', [job.id, next]);
+    await t.none('INSERT INTO job_events (job_id, kind, simulated) VALUES ($1,$2,TRUE)',
+      [job.id, next]);
+  });
+  const bid = await acceptedBid({ ...job, state: next });
+  res.json({ state: next, simulated: true,
+             cancellation: bid ? cancellationPreview(next, bid.amount) : null });
+}));
+
+/* ======================================================== 12. complete === */
+app.post('/api/jobs/:id/complete', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const job = await mustJob(req, u);
+  if (job.state !== STATES.IN_PROGRESS) fail(409, `Cannot complete a job that is ${job.state}.`);
+  const bid = await acceptedBid(job);
+  if (!bid) fail(409, 'This job has no accepted bid.');
+  const payment = await db.one(
+    "SELECT * FROM payments WHERE job_id = $1 AND purpose = 'job_payment'", [job.id]);
+  if (!payment || payment.reconciliation_state !== 'verified') {
+    fail(409, 'The job payment has not been verified.');
+  }
+
+  // No Hyperswitch call: the money was captured at approval. This reallocates
+  // the internal reservation.
+  const e = economics(bid.amount);
+  const out = await db.transaction(async t => {
+    await t.none('UPDATE jobs SET state = $2 WHERE id = $1', [job.id, STATES.COMPLETED]);
+    await t.none('INSERT INTO job_events (job_id, kind, simulated) VALUES ($1,$2,TRUE)',
+      [job.id, STATES.COMPLETED]);
+    return new Ledger(t).post(jobCompleted({
+      userId: u.id, jobId: job.id, providerId: bid.provider_id,
+      paymentId: payment.payment_id, bidAmount: bid.amount,
+    }), t);
+  });
+
+  res.json({
+    state: STATES.COMPLETED,
+    allocation: { providerPayable: e.payout, platformRevenue: e.take, total: e.charge },
+    externalPayout: 'simulated',
+    note: 'Credited to the provider payable balance in Swoop\u2019s ledger. External payout is simulated because the sandbox provides no payout connector.',
+    duplicate: out.duplicate,
+  });
+}));
+
+/* ========================================================== 13. cancel === */
+app.post('/api/jobs/:id/cancel', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const job = await mustJob(req, u);
+  const tier = cancellationTier(job.state);
+  if (!tier) fail(409, `Cannot cancel a job that is ${job.state}.`);
+  const bid = await acceptedBid(job);
+  if (!bid) fail(409, 'This job has no accepted bid.');
+  const payment = await db.one(
+    "SELECT * FROM payments WHERE job_id = $1 AND purpose = 'job_payment'", [job.id]);
+  if (!payment || payment.reconciliation_state !== 'verified') {
+    fail(409, 'The job payment has not been verified.');
+  }
+
+  const e = economics(bid.amount);
+  const preTravel = tier === 'PRE_TRAVEL';
+  const posting = preTravel
+    ? cancelledPreTravel({ userId: u.id, jobId: job.id,
+                           paymentId: payment.payment_id, bidAmount: bid.amount })
+    : cancelledEnRoute({ userId: u.id, jobId: job.id, providerId: bid.provider_id,
+                         paymentId: payment.payment_id, bidAmount: bid.amount });
+  const state = preTravel ? STATES.CANCELLED_PRE_TRAVEL : STATES.CANCELLED_EN_ROUTE;
+
+  const out = await db.transaction(async t => {
+    await t.none('UPDATE jobs SET state = $2 WHERE id = $1', [job.id, state]);
+    await t.none('INSERT INTO job_events (job_id, kind, simulated) VALUES ($1,$2,TRUE)',
+      [job.id, state]);
+    return new Ledger(t).post(posting, t);
+  });
+
+  res.json({
+    state, tier,
+    retainedByProvider: preTravel ? 0 : PENALTY,
+    creditedToWallet: preTravel ? e.charge : e.charge - PENALTY,
+    platformRevenue: 0,
+    wallet: await walletOf(u.id),
+    note: 'No further Hyperswitch charge. This reallocates funds already captured for the job.',
+    duplicate: out.duplicate,
+  });
+}));
+
+/* ============================================================= 14. tip === */
+app.post('/api/jobs/:id/tip', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const job = await mustJob(req, u);
+  if (job.state !== STATES.COMPLETED) fail(409, 'Tips are for completed jobs.');
+  const bid = await acceptedBid(job);
   const amount = Number(req.body.amount);
-  if (!Number.isInteger(amount) || amount <= 0) {
-    return res.status(400).json({ error: 'Enter a whole amount greater than zero.' });
-  }
-  if (amount > ledger.walletOf(u.id)) return res.status(402).json({ error: 'More than your balance.' });
+  if (!Number.isInteger(amount) || amount <= 0) fail(400, 'Enter a whole tip amount.');
+  if (amount > await walletOf(u.id)) fail(402, 'That is more than your Swoop wallet holds.');
 
-  // Check capacity BEFORE moving anything. Issuing refunds lot by lot and then
-  // failing part-way left the customer with an error and a debited wallet.
-  const capacity = withdrawable(u.id);
-  if (amount > capacity) {
-    return res.status(409).json({
-      error: capacity === 0
-        ? 'None of your balance came from a card payment, so there is nothing to return.'
-        : `Only ${fmt(capacity)} can be returned to your card. The rest came from Swoop credit.`,
-      withdrawable: capacity,
-    });
-  }
-
-  // A refund must name the payment it reverses, so draw down top-up lots in order.
-  const lots = db.prepare(`SELECT * FROM payments WHERE user_id=? AND purpose='wallet_topup'
-                           AND status='succeeded' ORDER BY created_at`).all(u.id);
-  let left = amount; const issued = [];
-  for (const lot of lots) {
-    if (left <= 0) break;
-    const available = lot.amount - lot.amount_refunded;
-    if (available <= 0) continue;
-    const take = Math.min(available, left);
-    const r = await hs.createRefund({ paymentId: lot.payment_id, amount: take, reason: 'wallet withdrawal' },
-      `${lot.payment_id}:withdraw:${Date.now()}`);
-    db.prepare('INSERT INTO refunds (refund_id,payment_id,amount,status,reason,created_at) VALUES (?,?,?,?,?,?)')
-      .run(r.refund_id, lot.payment_id, take, r.status, 'withdrawal', now());
-    db.prepare('UPDATE payments SET amount_refunded = amount_refunded + ? WHERE payment_id=?')
-      .run(take, lot.payment_id);
-    ledger.post({ userId: u.id, reason: 'WITHDRAWAL', gatewayRef: r.refund_id,
-      entries: [debit(customerWallet(u.id), take), credit(REFUND_IN_TRANSIT, take)] });
-    issued.push({ refundId: r.refund_id, amount: take, paymentId: lot.payment_id });
-    left -= take;
-  }
-  // Capacity was verified up front, so this should be unreachable.
-  if (left > 0) console.error(`withdrawal shortfall of ${left} for ${u.id} — capacity check is wrong`);
-  res.json({ refunds: issued, wallet: ledger.walletOf(u.id), withdrawable: withdrawable(u.id) });
+  const out = await ledger.post(tipPosting({
+    userId: u.id, jobId: job.id, providerId: bid.provider_id,
+    tipId: String(req.body.tipId ?? 'tip'), amount,
+  }));
+  res.json({ wallet: await walletOf(u.id), duplicate: out.duplicate,
+             note: 'The provider keeps the whole tip. Swoop takes no fee.' });
 }));
 
-/* ---------------------------------------------------------------- boot ----- */
-/* Importing this module must not start a server or a background sweep — tests
-   import it to drive routes directly. */
+/* ================================================ 15. simulated withdraw = */
+app.post('/api/wallet/withdraw', wrap(async (req, res) => {
+  const u = await userOf(req);
+  const amount = Number(req.body.amount);
+  const withdrawalId = String(req.body.withdrawalId ?? '').trim();
+  if (!Number.isInteger(amount) || amount <= 0) fail(400, 'Enter a whole amount greater than zero.');
+  if (!withdrawalId) fail(400, 'withdrawalId is required.');
+  if (amount > await walletOf(u.id)) fail(402, 'That is more than your Swoop wallet holds.');
+
+  const out = await ledger.post(simulatedWithdrawal({ userId: u.id, withdrawalId, amount }));
+  res.json({
+    wallet: await walletOf(u.id),
+    simulated: true,
+    duplicate: out.duplicate,
+    note: 'Simulated withdrawal recorded in Swoop\u2019s ledger. No external card refund, payout or bank transfer was initiated through Hyperswitch.',
+  });
+}));
+
+/* ================================================================ boot === */
 export function start(port = process.env.PORT || 3000) {
-  new AuthWatchdog(db).start();
   return app.listen(port, () => console.log(`Swoop on http://localhost:${port}`));
 }
 if (process.env.SWOOP_AUTOSTART !== 'false') start();
 
-export { app, db, ledger };
+export { app, db, ledger, flow };

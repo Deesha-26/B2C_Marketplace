@@ -4,7 +4,9 @@
   "description": "B2C home-services marketplace demonstrating a full payment lifecycle on Hyperswitch: authorize, capture, partial capture, void, refund, extended authorization, webhooks and a double-entry ledger.",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=22.5.0" },
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "start": "node --experimental-sqlite server/index.js",
     "dev": "node --watch --experimental-sqlite server/index.js",
@@ -14,10 +16,23 @@
     "test:client": "node --experimental-sqlite --test test/client.test.js",
     "test:journey": "node --experimental-sqlite --test test/journey.test.js",
     "verify": "node scripts/verify-hyperswitch.mjs",
-    "webhook:test": "node scripts/send-test-webhook.mjs"
+    "diagnose": "npm run diagnose:routing && npm run diagnose:settlement",
+    "webhook:test": "node scripts/send-test-webhook.mjs",
+    "diagnose:routing": "node --env-file=.env scripts/diagnostic-a-routing.mjs",
+    "diagnose:settlement": "node --env-file=.env scripts/diagnostic-b-settlement.mjs",
+    "diagnose:idempotency": "node --env-file=.env scripts/diagnostic-c-idempotency.mjs",
+    "test:supabase": "node --env-file=.env --test test/supabase.smoke.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "pg": "^8.23.0"
   },
-  "keywords": ["hyperswitch", "marketplace", "payments", "ledger", "escrow", "juspay"]
+  "keywords": [
+    "hyperswitch",
+    "marketplace",
+    "payments",
+    "ledger",
+    "escrow",
+    "juspay"
+  ]
 }

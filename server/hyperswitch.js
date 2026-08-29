@@ -1,12 +1,16 @@
 /**
  * The ONLY module that talks to Hyperswitch.
  *
- * The secret key is read from the environment and never leaves this process.
- * The browser receives a client_secret per payment plus the publishable key,
- * which is all the Web SDK needs.
+ * The secret key is read from the environment and never leaves this process. The
+ * browser receives the publishable key and a per-payment client_secret.
  *
- * No connector is ever named in a request. Routing, retries and 3DS are
- * Hyperswitch's job — that is the whole point of putting it in the path.
+ * NO REQUEST NAMES A CONNECTOR. Routing, retries and rerouting are decided by
+ * dashboard configuration; Diagnostic A asserts the request body is clean.
+ *
+ * Round 1 surface only. Capture, void, extend_authorization and refunds are
+ * deliberately absent: Diagnostic B could not establish manual capture on either
+ * dummy processor, so the operations that depend on a hold are deferred rather
+ * than shipped untested.
  */
 const BASE = process.env.HYPERSWITCH_BASE_URL || 'https://sandbox.hyperswitch.io';
 const KEY = process.env.HYPERSWITCH_SECRET_KEY;
@@ -14,100 +18,55 @@ const PROFILE = process.env.HYPERSWITCH_PROFILE_ID;
 
 export class HyperswitchError extends Error {
   constructor(status, body) {
-    const e = body?.error || {};
+    const e = body?.error ?? {};
     super(e.message || `Hyperswitch returned ${status}`);
     this.name = 'HyperswitchError';
-    this.status = status;
+    this.status = status;      // 404 means definitely absent; see PaymentFlow
     this.code = e.code;
     this.type = e.type;
-    this.body = body;
   }
 }
 
-async function call(method, path, body, idempotencyKey) {
-  if (!KEY) throw new Error('HYPERSWITCH_SECRET_KEY is not set — copy .env.example to .env');
-  const headers = { 'api-key': KEY, 'Content-Type': 'application/json', Accept: 'application/json' };
-  // Derived, never random: a retry of the same logical operation must produce
-  // the same key, or the retry becomes a second payment.
-  if (idempotencyKey) headers['x-idempotency-key'] = idempotencyKey;
-
+async function call(method, path, body) {
+  if (!KEY) throw new Error('HYPERSWITCH_SECRET_KEY is not set');
   const res = await fetch(`${BASE}${path}`, {
-    method, headers, body: body ? JSON.stringify(body) : undefined,
+    method,
+    headers: { 'api-key': KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
-  const json = text ? JSON.parse(text) : {};
+  let json = {};
+  try { json = text ? JSON.parse(text) : {}; } catch { json = { unparsed: text }; }
   if (!res.ok) throw new HyperswitchError(res.status, json);
   return json;
 }
 
 /**
- * Normalises the routing trail so the UI can show what Hyperswitch actually
- * did — which connector handled it, and whether it was retried elsewhere.
- * This is how rerouting gets demonstrated rather than asserted.
+ * Creates a payment. `body.payment_id` must be the deterministic id derived from
+ * the operation key — Hyperswitch treats a merchant-provided payment_id as the
+ * idempotency key for creation, which is what makes crash recovery safe.
  */
-export function routingTrail(payment) {
-  const attempts = payment.attempts || [];
-  return attempts.map((a, i) => ({
-    n: i + 1,
-    connector: a.connector,
-    status: a.status,
-    errorCode: a.error_code || null,
-    errorMessage: a.error_message || null,
-    at: a.created_at,
-  }));
-}
+export const createPayment = body =>
+  call('POST', '/payments', { ...body, profile_id: PROFILE });
 
-export const createPayment = (body, idem) =>
-  call('POST', '/payments', { ...body, profile_id: PROFILE }, idem);
-
+/** Server-side retrieval. The only basis for recognising captured funds. */
 export const retrievePayment = id =>
   call('GET', `/payments/${id}?force_sync=true&expand_attempts=true`);
 
 /**
- * Capturing less than the authorized amount performs a PARTIAL capture: the
- * remainder is voided at the processor. That is how the $30 en-route
- * cancellation settles without needing a partial refund.
+ * Normalises the attempt trail for display. Read live on every request and never
+ * stored: a stored copy could disagree with the source it exists to evidence.
  */
-export const capturePayment = (id, amountToCapture, idem) =>
-  call('POST', `/payments/${id}/capture`,
-    amountToCapture != null ? { amount_to_capture: amountToCapture } : {}, idem);
-
-/** Releases the hold without charging anything. Only valid pre-capture. */
-export const voidPayment = (id, idem) =>
-  call('POST', `/payments/${id}/cancel`, { cancellation_reason: 'requested_by_customer' }, idem);
-
-/**
- * Pushes the capture deadline out. Valid only for manual-capture payments.
- * Some connectors apply it automatically at authorization; others need this
- * explicit call.
- */
-export const extendAuthorization = (id, idem) =>
-  call('POST', `/payments/${id}/extend_authorization`, {}, idem);
-
-export const createRefund = ({ paymentId, amount, reason }, idem) =>
-  call('POST', '/refunds', { payment_id: paymentId, amount, reason }, idem);
-
-export const retrieveRefund = id => call('GET', `/refunds/${id}`);
-
-/** Cards the customer chose to save, held in the Hyperswitch vault. */
-export const listSavedCards = customerId =>
-  call('GET', `/customers/${customerId}/payment_methods`);
-
-export const deleteSavedCard = paymentMethodId =>
-  call('DELETE', `/payment_methods/${paymentMethodId}`);
+export function routingTrail(payment) {
+  const attempts = Array.isArray(payment?.attempts) ? payment.attempts : [];
+  return attempts.map((a, i) => ({
+    n: i + 1,
+    attemptId: a.attempt_id ?? null,
+    processor: a.connector ?? a.merchant_connector_id ?? null,
+    status: a.status ?? null,
+    errorCode: a.error_code ?? null,
+    errorMessage: a.error_message ?? null,
+  }));
+}
 
 export const publishableKey = () => process.env.HYPERSWITCH_PUBLISHABLE_KEY || '';
-
-/**
- * The authorization deadline. Hyperswitch returns `capture_by` when the
- * connector supplies it; when it doesn't, fall back to computing from when
- * extended authorization was last applied.
- */
-export function captureDeadline(payment) {
-  if (payment.capture_by) return payment.capture_by;
-  if (payment.extended_authorization_last_applied_at) {
-    const base = new Date(payment.extended_authorization_last_applied_at).getTime();
-    return new Date(base + 7 * 24 * 3600 * 1000).toISOString();
-  }
-  return null;
-}
