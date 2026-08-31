@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { open, now, uid } from './db/index.js';
 import { economics, PENALTY, WALLET_FLOOR, MIN_TOPUP, CUSTOMER_FEE, LEAD_FEE, fmt } from './money.js';
 import {
-  Ledger, jobCompleted, cancelledPreTravel, cancelledEnRoute, tip as tipPosting,
+  Ledger, jobCompleted, cancelledPreTravel, cancelledEnRoute, cancelledInProgress, tip as tipPosting,
   simulatedWithdrawal, customerWallet, isSimulated,
 } from './ledger/index.js';
 import * as hs from './hyperswitch.js';
@@ -194,6 +194,12 @@ app.post('/api/wallet/topup', wrap(async (req, res) => {
 /* ============================================ 4. wallet top-up reconcile == */
 app.post('/api/wallet/topup/:requestId/reconcile', wrap(async (req, res) => {
   const u = await userOf(req);
+  const operationKey = walletTopUpKey(u.id, req.params.requestId);
+  const operation = await ops.get(db, operationKey);
+
+  if (!operation) {
+  fail(404, 'Payment operation not found.');
+  }
   const result = await flow.reconcile({
     operationKey: walletTopUpKey(u.id, req.params.requestId),
     requestingUserId: u.id,
@@ -232,6 +238,21 @@ app.post('/api/jobs', wrap(async (req, res) => {
   res.json({ id: jobId });
 }));
 
+app.get('/api/jobs', wrap(async (req, res) => {
+  const u = await userOf(req);
+
+  const jobs = await db.all(
+    `SELECT id, service, description, address, scheduled_for,
+            is_emergency, state, accepted_bid_id, created_at
+       FROM jobs
+      WHERE user_id = $1
+      ORDER BY created_at DESC`,
+    [u.id]
+  );
+
+  res.json(jobs);
+}));
+
 /* ========================================================== 6. job read === */
 app.get('/api/jobs/:id', wrap(async (req, res) => {
   const u = await userOf(req);
@@ -255,6 +276,7 @@ app.get('/api/jobs/:id', wrap(async (req, res) => {
     approval,
     payment: payment && {
       paymentId: payment.payment_id,
+      amount: approval ? Number(approval.total_amount) : 0,
       reconciliationState: payment.reconciliation_state,
       lastObservedExternalStatus: payment.last_observed_external_status,
       discrepancyReason: payment.discrepancy_reason,
@@ -364,7 +386,8 @@ app.get('/api/jobs/:id/attempts', wrap(async (req, res) => {
     "SELECT payment_id FROM payments WHERE job_id = $1 AND purpose = 'job_payment'", [job.id]);
   if (!payment) fail(404, 'No payment on this job yet.');
 
-  const retrieved = await hs.retrievePayment(payment.payment_id);
+  const retrieved =
+  await flow.hs.retrievePayment(payment.payment_id);
   res.json({
     paymentId: payment.payment_id,
     finalStatus: retrieved.status,
@@ -429,38 +452,106 @@ app.post('/api/jobs/:id/cancel', wrap(async (req, res) => {
   const u = await userOf(req);
   const job = await mustJob(req, u);
   const tier = cancellationTier(job.state);
-  if (!tier) fail(409, `Cannot cancel a job that is ${job.state}.`);
+
+  if (!tier) {
+    fail(409, `Cannot cancel a job that is ${job.state}.`);
+  }
+
   const bid = await acceptedBid(job);
-  if (!bid) fail(409, 'This job has no accepted bid.');
+
+  if (!bid) {
+    fail(409, 'This job has no accepted bid.');
+  }
+
   const payment = await db.one(
-    "SELECT * FROM payments WHERE job_id = $1 AND purpose = 'job_payment'", [job.id]);
+    `SELECT *
+       FROM payments
+      WHERE job_id = $1
+        AND purpose = 'job_payment'`,
+    [job.id]
+  );
+
   if (!payment || payment.reconciliation_state !== 'verified') {
     fail(409, 'The job payment has not been verified.');
   }
 
   const e = economics(bid.amount);
-  const preTravel = tier === 'PRE_TRAVEL';
-  const posting = preTravel
-    ? cancelledPreTravel({ userId: u.id, jobId: job.id,
-                           paymentId: payment.payment_id, bidAmount: bid.amount })
-    : cancelledEnRoute({ userId: u.id, jobId: job.id, providerId: bid.provider_id,
-                         paymentId: payment.payment_id, bidAmount: bid.amount });
-  const state = preTravel ? STATES.CANCELLED_PRE_TRAVEL : STATES.CANCELLED_EN_ROUTE;
+
+  let posting;
+  let state;
+  let retainedAmount;
+  let retainedByProvider;
+  let creditedToWallet;
+  let platformRevenue;
+
+  if (tier === 'PRE_TRAVEL') {
+    posting = cancelledPreTravel({
+      userId: u.id,
+      jobId: job.id,
+      paymentId: payment.payment_id,
+      bidAmount: bid.amount,
+    });
+
+    state = STATES.CANCELLED_PRE_TRAVEL;
+    retainedAmount = 0;
+    retainedByProvider = 0;
+    creditedToWallet = e.charge;
+    platformRevenue = 0;
+  } else if (tier === 'EN_ROUTE') {
+    posting = cancelledEnRoute({
+      userId: u.id,
+      jobId: job.id,
+      providerId: bid.provider_id,
+      paymentId: payment.payment_id,
+      bidAmount: bid.amount,
+    });
+
+    state = STATES.CANCELLED_EN_ROUTE;
+    retainedAmount = PENALTY;
+    retainedByProvider = PENALTY;
+    creditedToWallet = e.charge - PENALTY;
+    platformRevenue = 0;
+  } else {
+    posting = cancelledInProgress({
+      userId: u.id,
+      jobId: job.id,
+      providerId: bid.provider_id,
+      paymentId: payment.payment_id,
+      bidAmount: bid.amount,
+    });
+
+    state = STATES.CANCELLED_IN_PROGRESS;
+    retainedAmount = e.charge;
+    retainedByProvider = e.payout;
+    creditedToWallet = 0;
+    platformRevenue = e.take;
+  }
 
   const out = await db.transaction(async t => {
-    await t.none('UPDATE jobs SET state = $2 WHERE id = $1', [job.id, state]);
-    await t.none('INSERT INTO job_events (job_id, kind, simulated) VALUES ($1,$2,TRUE)',
-      [job.id, state]);
+    await t.none(
+      'UPDATE jobs SET state = $2 WHERE id = $1',
+      [job.id, state]
+    );
+
+    await t.none(
+      `INSERT INTO job_events (job_id, kind, simulated)
+       VALUES ($1,$2,TRUE)`,
+      [job.id, state]
+    );
+
     return new Ledger(t).post(posting, t);
   });
 
   res.json({
-    state, tier,
-    retainedByProvider: preTravel ? 0 : PENALTY,
-    creditedToWallet: preTravel ? e.charge : e.charge - PENALTY,
-    platformRevenue: 0,
+    state,
+    tier,
+    retainedAmount,
+    retainedByProvider,
+    creditedToWallet,
+    platformRevenue,
     wallet: await walletOf(u.id),
-    note: 'No further Hyperswitch charge. This reallocates funds already captured for the job.',
+    note:
+      'No further Hyperswitch charge. This reallocates funds already captured for the job.',
     duplicate: out.duplicate,
   });
 }));

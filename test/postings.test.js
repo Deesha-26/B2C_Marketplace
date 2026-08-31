@@ -10,7 +10,7 @@ import assert from 'node:assert/strict';
 
 import { economics, PENALTY } from '../server/money.js';
 import {
-  walletTopUp, jobReservation, jobCompleted, cancelledPreTravel, cancelledEnRoute,
+  walletTopUp, jobReservation, jobCompleted, cancelledPreTravel, cancelledEnRoute, cancelledInProgress,
   tip, simulatedWithdrawal, simulatedProviderSettlement,
   assertBalanced, signed, isSimulated, debit, credit,
   PSP_CLEARING, PLATFORM_REVENUE, customerWallet, jobReserved,
@@ -32,6 +32,15 @@ const ALL = [
   ['jobCompleted',       jobCompleted({ userId: U, jobId: J, providerId: P, paymentId: PAY, bidAmount: BID })],
   ['cancelledPreTravel', cancelledPreTravel({ userId: U, jobId: J, paymentId: PAY, bidAmount: BID })],
   ['cancelledEnRoute',   cancelledEnRoute({ userId: U, jobId: J, providerId: P, paymentId: PAY, bidAmount: BID })],
+  ['cancelledInProgress',
+  cancelledInProgress({
+    userId: U,
+    jobId: J,
+    providerId: P,
+    paymentId: PAY,
+    bidAmount: BID,
+  }),
+],
   ['tip',                tip({ userId: U, jobId: J, providerId: P, tipId: 't1', amount: 1000 })],
   ['simulatedWithdrawal', simulatedWithdrawal({ userId: U, withdrawalId: 'w1', amount: 1500 })],
   ['simulatedSettlement', simulatedProviderSettlement({ providerId: P, settlementId: 's1', amount: E.payout })],
@@ -163,6 +172,32 @@ describe('cancelled en route', () => {
   });
 });
 
+describe('cancelled after work started', () => {
+  const t = cancelledInProgress({
+    userId: U,
+    jobId: J,
+    providerId: P,
+    paymentId: PAY,
+    bidAmount: BID,
+  });
+
+  test('the customer receives no wallet credit', () => {
+    assert.equal(on(t, customerWallet(U)), 0);
+  });
+
+  test('the provider receives the normal net payout', () => {
+    assert.equal(on(t, providerPayable(P)), -E.payout);
+  });
+
+  test('the platform receives its normal marketplace revenue', () => {
+    assert.equal(on(t, PLATFORM_REVENUE), -E.take);
+  });
+
+  test('the complete reservation is drained', () => {
+    assert.equal(on(t, jobReserved(J)), E.charge);
+  });
+});
+
 describe('tips', () => {
   const t = tip({ userId: U, jobId: J, providerId: P, tipId: 't1', amount: 1000 });
   test('the wallet funds it and the provider keeps all of it', () => {
@@ -233,6 +268,38 @@ describe('fee model', () => {
   });
 });
 
+test('in-progress cancellation balances at awkward amounts', () => {
+  for (const bid of [1, 7, 99, 733, 9733, 12345, 49999]) {
+    const e = economics(bid);
+
+    const t = cancelledInProgress({
+      userId: U,
+      jobId: J,
+      providerId: P,
+      paymentId: PAY,
+      bidAmount: bid,
+    });
+
+    assert.equal(
+      t.entries.reduce((sum, entry) => sum + signed(entry), 0),
+      0,
+      `bid=${bid}`
+    );
+
+    assert.equal(
+      on(t, providerPayable(P)),
+      -e.payout,
+      `bid=${bid}: provider payout`
+    );
+
+    assert.equal(
+      on(t, PLATFORM_REVENUE),
+      -e.take,
+      `bid=${bid}: platform revenue`
+    );
+  }
+});
+
 describe('idempotency keys are deterministic', () => {
   test('the same operation produces the same key twice', () => {
     const a = jobCompleted({ userId: U, jobId: J, providerId: P, paymentId: PAY, bidAmount: BID });
@@ -240,11 +307,18 @@ describe('idempotency keys are deterministic', () => {
     assert.equal(a.idempotencyKey, b.idempotencyKey);
   });
 
-  test('all three job outcomes share one settlement key', () => {
+  test('all four job outcomes share one settlement key', () => {
     const keys = [
       jobCompleted({ userId: U, jobId: J, providerId: P, paymentId: PAY, bidAmount: BID }),
       cancelledPreTravel({ userId: U, jobId: J, paymentId: PAY, bidAmount: BID }),
       cancelledEnRoute({ userId: U, jobId: J, providerId: P, paymentId: PAY, bidAmount: BID }),
+      cancelledInProgress({
+        userId: U,
+        jobId: J,
+        providerId: P,
+        paymentId: PAY,
+        bidAmount: BID,
+      }),
     ].map(t => t.idempotencyKey);
     assert.deepEqual(new Set(keys), new Set([`${J}:settle`]),
       'a job settles once — completing and cancelling must not both post');

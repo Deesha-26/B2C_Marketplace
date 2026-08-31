@@ -5,7 +5,16 @@
 const S = {
   screen: 'home', user: null, wallet: 0, canBook: false, activity: [],
   config: {}, jobs: [], job: null, bids: [], sel: null, chat: [],
-  draft: { service: 'Plumbing' }, rating: 0, tip: 0, van: { x: 12, y: 84 },
+  draft: {
+  service: '',
+  address: '',
+  date: '',
+  time: '',
+  urgent: null,
+  },
+  rating: 0,
+  tip: 0,
+  van: { x: 12, y: 84 },
   pings: 0, eta: 22, busy: false, error: null, loading: true, lastRouting: null,
 };
 
@@ -66,11 +75,13 @@ async function loadJob(id) {
 function renderStrip() {
   if (!S.user) { $('strip').hidden = true; return; }
   $('strip').hidden = false;
-  const hold = S.job && ['SCHEDULED', 'EN_ROUTE', 'ARRIVED', 'IN_PROGRESS'].includes(S.job.state)
+  const hold = S.job && ['RESERVED', 'EN_ROUTE', 'ARRIVED', 'IN_PROGRESS'].includes(S.job.state)
     ? (S.jobPayment?.amount ?? 0) : 0;
-  $('who').textContent = `${S.user.name} · wallet`;
+  const email = localStorage.getItem('swoop_email') || S.user.display_email || '';
+  const customerName = email ? email.split('@')[0] : 'Demo customer';
+  $('who').textContent = `${customerName} · wallet`;
   $('wTotal').textContent = fmt(S.wallet);
-  const parts = [['wallet', S.wallet, 'Available', '#5AE0A8'], ['hold', hold, 'Held on card', '#5A6CF5']];
+  const parts = [['wallet', S.wallet, 'Available', '#5AE0A8'], ['hold', hold, 'Reserved for jobs', '#5A6CF5']];
   const sum = parts.reduce((s, p) => s + p[1], 0);
   $('wBar').innerHTML = sum === 0 ? '<div class="seg seg-empty"></div>'
     : parts.filter(p => p[1] > 0).map(p => `<div class="seg seg-${p[0]}" style="flex-grow:${p[1]}"></div>`).join('');
@@ -87,7 +98,7 @@ V.home = () => `
 <div class="screen">
   <div class="eyebrow">Swoop</div>
   <h1>What needs fixing?</h1>
-  <p class="sub">Post a job, compare real bids, watch them arrive.</p>
+  <p class="sub">Post a job, compare demo provider bids, and track their progress.</p>
 
   <div class="grid" style="margin-top:var(--s4)">
     ${['Plumbing', 'Electrical', 'Locksmith', 'Appliance repair', 'HVAC'].map(s => `
@@ -113,30 +124,106 @@ V.post = () => `
   <div class="eyebrow">${esc(S.draft.service)}</div>
   <h1>Tell us what's wrong</h1>
   <label for="desc">Describe the job</label>
-  <textarea id="desc" placeholder="Kitchen tap dripping steadily, cabinet underneath is damp"
+  <textarea id="desc" placeholder="${esc({
+  Plumbing: 'Kitchen tap is dripping steadily and the cabinet underneath is damp.',
+  Electrical: 'The kitchen outlets stopped working and resetting the breaker did not help.',
+  Locksmith: 'The front-door deadbolt is jammed and the key will not turn.',
+  'Appliance repair': 'The washing machine fills with water but stops before the spin cycle.',
+  HVAC: 'The air conditioner is running, but the rooms are not getting cooler.'
+}[S.draft.service] || 'Describe what is happening and what you need fixed.')}"
     oninput="S.draft.desc=this.value;hint()">${esc(S.draft.desc || '')}</textarea>
   <p class="sub" id="deschint">${(S.draft.desc || '').length < 8
     ? 'A sentence or two helps providers bid accurately.' : 'Good — enough for a provider to price it.'}</p>
 
   <label for="addr">Address</label>
-  <input id="addr" value="${esc(S.draft.address || '118 Mathilda Pl, Sunnyvale, CA')}" oninput="S.draft.address=this.value">
+  <label for="addr">Address</label>
+
+<input
+  id="addr"
+  type="text"
+  list="address-suggestions"
+  autocomplete="street-address"
+  placeholder="Start typing your address"
+  value="${esc(S.draft.address || '')}"
+  oninput="S.draft.address=this.value"
+/>
+
+<datalist id="address-suggestions">
+  <option value="118 Mathilda Place, Sunnyvale, CA 94086"></option>
+  <option value="201 South Market Street, San Jose, CA 95113"></option>
+  <option value="450 Serra Mall, Stanford, CA 94305"></option>
+  <option value="1600 Amphitheatre Parkway, Mountain View, CA 94043"></option>
+  <option value="1 Hacker Way, Menlo Park, CA 94025"></option>
+</datalist>
+
+<p class="sub">Demo address suggestions for this prototype.</p>
   <div class="row">
-    <div><label for="d">Date</label><input id="d" type="date" value="${new Date().toISOString().slice(0, 10)}"></div>
-    <div><label for="t">Time</label><input id="t" type="time" value="14:00"></div>
-  </div>
+    <div>
+  <label for="d">Date</label>
+  <input
+    id="d"
+    type="date"
+    min="${new Date().toISOString().slice(0, 10)}"
+    value="${esc(S.draft.date || '')}"
+    onchange="S.draft.date=this.value"
+  >
+</div>
 
-  <label>How urgent?</label>
-  <div class="chips">
-    <button class="chip" aria-pressed="${!S.draft.urgent}" onclick="S.draft.urgent=false;render()">Scheduled</button>
-    <button class="chip urgent" aria-pressed="${!!S.draft.urgent}" onclick="S.draft.urgent=true;render()">Emergency</button>
-  </div>
-  <p class="sub">${S.draft.urgent
-    ? 'Goes to the top of every nearby provider\u2019s list. Bids come in higher.'
-    : 'Providers bid for the slot you chose.'}</p>
+<div>
+  <label for="t">Time</label>
+  <input
+    id="t"
+    type="time"
+    value="${esc(S.draft.time || '')}"
+    onchange="S.draft.time=this.value"
+  >
+</div>
+</div>
 
-  <button class="btn ${S.draft.urgent ? 'btn-signal' : ''}" onclick="submitJob()"
-    ${(S.draft.desc || '').length < 8 || S.busy ? 'disabled' : ''}>
-    ${S.busy ? 'Posting…' : 'Request bids'}</button>
+<label>How urgent?</label>
+
+<div class="chips">
+  <button
+    type="button"
+    class="chip"
+    aria-pressed="${S.draft.urgent === false}"
+    onclick="S.draft.urgent=false;render()">
+    Scheduled
+  </button>
+
+  <button
+    type="button"
+    class="chip urgent"
+    aria-pressed="${S.draft.urgent === true}"
+    onclick="S.draft.urgent=true;render()">
+    Emergency
+  </button>
+</div>
+
+<p class="sub">${
+  S.draft.urgent === null
+    ? 'Choose Scheduled or Emergency.'
+    : S.draft.urgent === true
+      ? 'Prioritized for immediate service. Emergency bids may be higher.'
+      : 'Providers bid for the date and time you selected.'
+}</p>
+
+<button
+  class="btn ${S.draft.urgent === true ? 'btn-signal' : ''}"
+  onclick="submitJob()"
+  ${
+    (S.draft.desc || '').trim().length < 8 ||
+    !S.draft.address?.trim() ||
+    !S.draft.date ||
+    !S.draft.time ||
+    S.draft.urgent === null ||
+    S.busy
+      ? 'disabled'
+      : ''
+  }>
+  ${S.busy ? 'Posting…' : 'Request bids'}
+</button>
+
   <p class="sub" style="text-align:center">Nothing is charged until you pick a provider.</p>
 </div>`;
 
@@ -148,7 +235,7 @@ V.bids = () => {
   <div class="eyebrow">${esc(S.job.service)}${S.job.is_emergency ? ' · Emergency' : ''}</div>
   <h1>${S.bids.length ? `${S.bids.length} providers bid` : 'Finding providers'}</h1>
   <p class="sub">${S.bids.length
-    ? 'Choosing one places a hold on your card for that amount. You\u2019re charged when the work is done.'
+    ? 'Choosing a provider confirms the total. Your card is charged securely, and Swoop reserves the captured funds for completion or cancellation.'
     : 'Notifying providers near you.'}</p>
 
   ${S.bids.length === 0 ? `<div class="card" style="margin-top:var(--s4)">
@@ -163,7 +250,7 @@ V.bids = () => {
           <span><b>${esc(b.trade)}</b><br>
             <span class="sub">${esc(b.provider_name)} · ★ ${b.rating} · ${b.jobs_done} jobs</span></span>
         </div>
-        <span class="mono" style="font-weight:700">${fmt(b.charge)}</span>
+        <span class="mono" style="font-weight:700">${fmt(b.totalAmount)}</span>
       </div>
       ${b.note ? `<p class="sub" style="margin-top:var(--s2)">${esc(b.note)}</p>` : ''}
       <div>
@@ -177,12 +264,12 @@ V.bids = () => {
 
   ${S.sel != null ? (() => { const b = S.bids[S.sel]; return `
     <div class="breakdown">
-      <div><span>${esc(b.trade)}</span><span class="mono">${fmt(b.bid)}</span></div>
-      <div><span>Swoop service fee (7.5%)</span><span class="mono">${fmt(b.fee)}</span></div>
-      <div class="tot"><span>Held on your card</span><span class="mono">${fmt(b.charge)}</span></div>
+      <div><span>${esc(b.trade)}</span><span class="mono">${fmt(b.bidAmount)}</span></div>
+      <div><span>Swoop service fee (7.5%)</span><span class="mono">${fmt(b.feeAmount)}</span></div>
+      <div class="tot"><span>Total charged and reserved</span><span class="mono">${fmt(b.totalAmount)}</span></div>
     </div>
     <button class="btn" onclick="acceptBid()" ${S.busy ? 'disabled' : ''}>
-      ${S.busy ? 'Contacting your bank…' : `Book ${esc(b.provider_name.split(' ')[0])}`}</button>`; })()
+      ${S.busy ? 'Processing payment…' : `Book ${esc(b.provider_name.split(' ')[0])}`}</button>`; })()
     : S.bids.length ? '<p class="sub" style="text-align:center;margin-top:var(--s4)">Tap a bid to see the total.</p>' : ''}
   ${S.error ? `<div class="note bad"><b>${esc(S.error)}</b></div>` : ''}
 </div>`;
@@ -190,7 +277,7 @@ V.bids = () => {
 
 V.track = () => {
   const st = S.job.state;
-  const steps = [['Booked', 'SCHEDULED'], ['On the way', 'EN_ROUTE'], ['Arrived', 'ARRIVED'],
+  const steps = [['Booked', 'RESERVED'], ['On the way', 'EN_ROUTE'], ['Arrived', 'ARRIVED'],
                  ['Working', 'IN_PROGRESS'], ['Done', 'COMPLETED']];
   const idx = steps.findIndex(s => s[1] === st);
   const bid = acceptedBid();
@@ -211,7 +298,7 @@ V.track = () => {
     <div class="road" style="top:0;bottom:0;left:66%;width:9px"></div>
     <div class="pin pin-home" style="left:70%;top:26%"></div>
     <div class="pin pin-van" style="left:${S.van.x}%;top:${S.van.y}%"></div>
-    <div class="eta">${st === 'EN_ROUTE' ? `~${S.eta} min away` : st === 'SCHEDULED' ? 'Not set off yet'
+    <div class="eta">${st === 'EN_ROUTE' ? `~${S.eta} min away` : st === 'RESERVED' ? 'Not set off yet'
       : st === 'ARRIVED' ? 'At your door' : 'On site'}</div>
   </div>
   <p class="sub mono" style="font-size:11px">${S.pings} location pings recorded — kept as evidence for this job</p>
@@ -220,10 +307,14 @@ V.track = () => {
     <b>${s[0]}</b><div class="t mono">${stamps[s[1]] || '—'}</div></li>`).join('')}</ul>
 
   <div class="card">
-    <div class="flex"><span class="sub">Held on your card</span><span class="mono">${fmt(S.jobPayment?.amount)}</span></div>
-    <div class="flex"><span class="sub">Charged</span><span class="sub">When the job is finished</span></div>
-    ${S.jobPayment?.captureBy ? `<div class="flex"><span class="sub">Hold valid until</span>
-      <span class="sub mono">${new Date(S.jobPayment.captureBy).toLocaleString()}</span></div>` : ''}
+    <div class="flex">
+      <span class="sub">Captured and reserved for this job</span>
+      <span class="mono">${fmt(S.jobPayment?.amount ?? 0)}</span>
+    </div>
+    <div class="flex">
+      <span class="sub">Settlement</span>
+      <span class="sub">Allocated when the job completes or is cancelled</span>
+    </div>
   </div>
 
   <div class="note ${t.tone}"><b>${t.head}</b><br>${t.detail}</div>
@@ -240,7 +331,6 @@ V.track = () => {
   <div class="sectionhead"><h3 class="sub" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase">Demo — provider side</h3></div>
   <button class="btn btn-ghost" onclick="advance()" ${S.busy ? 'disabled' : ''}>
     ${idx < 4 ? `Advance to “${steps[idx + 1][0]}”` : 'Finish'}</button>
-  ${st === 'SCHEDULED' ? `<button class="btn btn-ghost" onclick="providerCancel()">Provider cancels</button>` : ''}
 </div>`;
 };
 
@@ -284,7 +374,9 @@ V.wallet = () => `
   <h1>${fmt(S.wallet)}</h1>
   <p class="sub">Covers tips and refunds. Jobs are charged to your card.</p>
   <button class="btn" onclick="openTopup()">Add money</button>
-  ${S.wallet > 0 ? `<button class="btn btn-ghost" onclick="withdraw()">Withdraw to card</button>` : ''}
+  ${S.wallet > 0 ? `<button class="btn btn-ghost" onclick="withdraw()">
+  Withdraw to card <span class="sub">(simulated)</span>
+</button>` : ''}
 
   ${S.lastRouting?.length ? `
     <div class="sectionhead"><h3>How your last payment was routed</h3></div>
@@ -306,9 +398,11 @@ V.wallet = () => `
 
 /* ------------------------------------------------------------- fragments */
 const STATE_LABEL = {
-  OPEN_FOR_BIDS: 'Taking bids', SCHEDULED: 'Booked', EN_ROUTE: 'On the way',
+  OPEN_FOR_BIDS: 'Taking bids', RESERVED: 'Booked', EN_ROUTE: 'On the way',
   ARRIVED: 'Arrived', IN_PROGRESS: 'In progress', COMPLETED: 'Completed',
-  CANCELLED_BY_CUSTOMER: 'Cancelled', CANCELLED_BY_PROVIDER: 'Provider cancelled',
+  CANCELLED_PRE_TRAVEL: 'Cancelled before travel',
+  CANCELLED_EN_ROUTE: 'Cancelled after travel started',
+  CANCELLED_IN_PROGRESS: 'Cancelled after work started',
 };
 const jobCard = j => `
   <button class="card tap" onclick="openJob('${j.id}')" style="margin-top:var(--s2)">
@@ -320,8 +414,8 @@ const jobCard = j => `
   </button>`;
 
 const label = r => ({
-  WALLET_TOPUP: 'Wallet topped up', JOB_AUTHORIZED: 'Card authorized', JOB_CAPTURED: 'Card charged',
-  JOB_SETTLED: 'Job settled', TIP: 'Tip', WITHDRAWAL: 'Withdrawn to card',
+  WALLET_TOPUP: 'Wallet topped up', JOB_AUTHORIZED: 'Payment captured and reserved', JOB_CAPTURED: 'Job funds allocated',
+  JOB_SETTLED: 'Job settled', TIP: 'Tip', WITHDRAWAL_SIMULATED: 'Withdrawal to card simulated',
   CANCELLED_PRE_ENROUTE: 'Cancelled — hold released', CANCEL_CAPTURE: 'Cancellation charge',
   CANCEL_SETTLE: 'Cancellation settled', PROVIDER_CANCELLED: 'Provider cancelled',
   PROVIDER_PENALTY: 'Compensation received', REFUND_SETTLED: 'Refund settled',
@@ -338,8 +432,8 @@ V.login = () => `
   <div class="screen" style="padding-top:54px">
     <div class="eyebrow">Swoop</div>
     <h1>Get someone out to you, fast.</h1>
-    <p class="sub" style="margin-top:10px">Post the job, compare real bids, watch them arrive.
-      Your card is only charged once the work is done.</p>
+    <p class="sub" style="margin-top:10px">Post the job, compare provider bids, and track their progress.
+      Choose a provider, approve the total, and pay securely. Swoop reserves the captured funds for completion or cancellation.</p>
 
     <div class="section">
       <div class="card">
@@ -352,7 +446,7 @@ V.login = () => `
       </div>
       <div class="card">
         <div class="who"><span class="avatar">3</span>
-          <span><b>Pay when it's finished</b><div class="sub">We hold the amount, we don't take it.</div></span></div>
+          <span><b>Approve and pay</b><div class="sub">Your approved total is charged and reserved by Swoop for the job.</div></span></div>
       </div>
     </div>
 
@@ -367,20 +461,45 @@ V.login = () => `
 
 /** Derives a stable account id from the email so returning users keep their
     wallet, jobs and saved cards. */
+/**
+ * Email is only a demo display label.
+ * Account identity is an unguessable UUID stored in this browser.
+ */
 async function signIn() {
   const email = String(S.loginEmail || '').trim().toLowerCase();
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return toast('Enter a valid email address.');
-  S.busy = true; render();
-  USER = 'usr_' + [...email].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7).toString(36);
+
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return toast('Enter a valid email address.');
+  }
+
+  S.busy = true;
+  render();
+
+  const storedUser = localStorage.getItem('swoop_user');
+  const isUuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      .test(storedUser || '');
+
+  USER = isUuid ? storedUser : crypto.randomUUID();
+
   localStorage.setItem('swoop_user', USER);
   localStorage.setItem('swoop_email', email);
-  try { await refresh(); S.screen = 'home'; toast('Welcome to Swoop.'); }
-  catch { toast('Could not reach Swoop. Is the server running?'); }
-  S.busy = false; render();
+
+  try {
+    await refresh();
+    S.screen = 'home';
+    toast('Welcome to Swoop.');
+  } catch (error) {
+    console.error('Swoop sign-in failed:', error);
+    toast('Could not reach Swoop. Check the browser console.');
+  } finally {
+    S.busy = false;
+    render();
+  }
 }
 
 function signOut() {
-  localStorage.removeItem('swoop_user');
+  localStorage.removeItem('swoop_email');
   USER = null;
   Object.assign(S, { user: null, wallet: 0, jobs: [], job: null, bids: [], activity: [], screen: 'login' });
   render();
@@ -394,13 +513,37 @@ function bestOf() {
   return { cheap: idx((x, y) => x.amount < y.amount), fast: idx((x, y) => x.eta_minutes < y.eta_minutes), top: idx((x, y) => x.rating > y.rating) };
 }
 function tier(state) {
-  const p = fmt(S.config.penalty ?? 3000);
-  if (state === 'SCHEDULED') return { tone: 'good', head: 'Free to cancel right now',
-    detail: 'They haven\u2019t set off. The hold is released and nothing is charged.' };
-  if (state === 'EN_ROUTE') return { tone: 'warn', head: `Cancelling now costs ${p}`,
-    detail: 'They\u2019re already travelling, so that covers the trip. The rest of the hold is released.' };
-  return { tone: 'bad', head: 'Cancelling now is charged in full',
-    detail: 'Work has started, so the whole amount goes through.' };
+  if (state === 'RESERVED') {
+    return {
+      tone: 'good',
+      head: 'Cancel now: full amount returned',
+      detail:
+        'The provider has not started travelling. The full captured amount will be credited to your Swoop wallet.',
+    };
+  }
+
+  if (['EN_ROUTE', 'ARRIVED'].includes(state)) {
+    return {
+      tone: 'bad',
+      head: 'Cancel now: $30 goes to the provider',
+      detail:
+        'The provider has committed time or travel. Swoop credits the remainder to your wallet.',
+    };
+  }
+  if (state === 'IN_PROGRESS') {
+    return {
+      tone: 'bad',
+      head: 'Cancel now: the full amount is retained',
+      detail:
+        'Work has started, so the job is charged in full.',
+    };
+  }
+
+  return {
+    tone: 'bad',
+    head: 'This job can no longer be cancelled',
+    detail: 'The job is already complete or cancelled.',
+  };
 }
 function hint() {
   const el = document.getElementById('deschint');
@@ -414,12 +557,20 @@ let hyper = null, widgets = null, unified = null;
 
 async function mountPayment(clientSecret, mountId, onDone) {
   hyper ??= Hyper(S.config.publishableKey);
-  widgets = hyper.widgets({ appearance: { theme: 'default' }, clientSecret });
+  widgets = hyper.widgets({
+  appearance: { theme: 'default' },
+  clientSecret,
+  locale: 'en'
+});
   unified = widgets.create('payment', {
-    // Lets the customer choose to save the card; consent travels as
-    // customer_acceptance on confirm.
-    displaySavedPaymentMethodsCheckbox: true,
-    displaySavedPaymentMethods: true,
+    wallets: {
+    walletReturnUrl: window.location.origin,
+    applePay: 'never',
+    googlePay: 'never',
+    payPal: 'never',
+  },
+    displaySavedPaymentMethodsCheckbox: false,
+    displaySavedPaymentMethods: false,
   });
   unified.mount(`#${mountId}`);
   return async () => {
@@ -455,26 +606,30 @@ function openTopup() {
     const b = e.target.closest('[data-a]'); if (!b) return;
     amount = Number(b.dataset.a);
     [...amts.children].forEach(c => c.setAttribute('aria-pressed', String(Number(c.dataset.a) === amount)));
+    requestId = crypto.randomUUID();
     prepare();
   };
 
-  let confirmFn = null, token = 0;
+  let confirmFn = null, token = 0, requestId = crypto.randomUUID();
   async function prepare() {
     const mine = ++token;
     $('paybtn').disabled = true; $('paybtn').textContent = 'Preparing…';
     $('payerr').innerHTML = '';
     try {
-      const p = await api('POST', '/api/wallet/topup', { amount });
+    const p = await api('POST', '/api/wallet/topup', {
+  amount,
+  requestId
+});
       if (mine !== token) return;
       $('payslot').innerHTML = '';
       confirmFn = await mountPayment(p.clientSecret, 'payslot');
       $('paybtn').disabled = false;
       $('paybtn').textContent = `Add ${fmt(amount)}`;
       $('paybtn').onclick = async () => {
-        $('paybtn').disabled = true; $('paybtn').textContent = 'Contacting your bank…';
+        $('paybtn').disabled = true; $('paybtn').textContent = 'Processing Payment';
         try {
           await confirmFn();
-          const s = await api('POST', `/api/wallet/topup/${p.paymentId}/settle`, {});
+          const s = await api('POST', `/api/wallet/topup/${requestId}/reconcile`, {});
           S.lastRouting = s.routing;
           closeModal(); await refresh(); render();
           toast(`${fmt(amount)} added. ${s.routing?.length > 1 ? 'Routed via ' + s.routing.at(-1).connector + ' after a retry.' : ''}`);
@@ -493,7 +648,10 @@ function openTopup() {
 
 async function withdraw() {
   try {
-    const r = await api('POST', '/api/wallet/withdraw', { amount: S.wallet });
+    const r = await api('POST', '/api/wallet/withdraw', {
+      amount: S.withdrawable,
+      withdrawalId: crypto.randomUUID(),
+    });
     await refresh(); render();
     toast(`${fmt(r.refunds.reduce((s, x) => s + x.amount, 0))} refunded to your card.`);
   } catch (e) { toast(e.message); }
@@ -502,66 +660,244 @@ const closeModal = () => { $('modal').innerHTML = ''; };
 
 /* --------------------------------------------------------------- actions */
 async function submitJob() {
+  if (!S.draft.address?.trim()) {
+  return toast('Choose or enter the job address.');
+}
   S.busy = true; render();
   try {
     const { id } = await api('POST', '/api/jobs', {
       service: S.draft.service, description: S.draft.desc,
-      address: S.draft.address || '118 Mathilda Pl, Sunnyvale, CA',
-      scheduledFor: new Date(Date.now() + 3 * 3.6e6).toISOString(),
-      isEmergency: !!S.draft.urgent,
+      address: S.draft.address.trim(),
+      scheduledFor: new Date(`${S.draft.date}T${S.draft.time}`).toISOString(),
+      isEmergency: !!S.draft.urgent === true,
     });
     S.busy = false;
-    await loadJob(id); await refresh(); S.sel = null; go('bids');
-    say(`${S.bids.length} bids received`);
+
+    await loadJob(id);
+    await refresh();
+    const arrivingBids = [...S.bids];
+
+    S.bids = [];
+    S.sel = null;
+    go('bids');
+
+    arrivingBids.forEach((bid, index) => {
+      setTimeout(() => {
+      // Do not update the wrong screen if the customer navigated away.
+        if (S.job?.id !== id || S.screen !== 'bids') return;
+
+          S.bids.push(bid);
+          render();
+
+          say(
+            index === 0
+            ? 'First demo provider bid received'
+            : `${S.bids.length} demo provider bids received`
+          );
+      }, 1200 + index * 1600);
+  });
   } catch (e) { S.busy = false; toast(e.message); render(); }
 }
 
 async function acceptBid() {
   const bid = S.bids[S.sel];
-  S.busy = true; S.error = null; render();
+
+  S.busy = true;
+  S.error = null;
+  render();
+
   try {
-    const a = await api('POST', `/api/jobs/${S.job.id}/accept`, { bidId: bid.id });
+    // 1. Record the customer’s approval of this bid and exact total.
+    const approval = await api(
+      'POST',
+      `/api/jobs/${S.job.id}/approve`,
+      { bidId: bid.id }
+    );
+
+    // 2. Create the automatic-capture Hyperswitch payment.
+    const payment = await api(
+      'POST',
+      `/api/jobs/${S.job.id}/pay`,
+      { approvalId: approval.approvalId }
+    );
+
+    if (!payment.clientSecret) {
+      throw new Error('Hyperswitch did not return a client secret.');
+    }
+
+    const total = approval.breakdown.totalAmount;
+
     $('modal').innerHTML = `
-      <div class="veil"><div class="sheet" role="dialog" aria-modal="true" aria-label="Confirm booking">
-        <div class="grab"></div>
-        <h2>Book ${esc(bid.provider_name)}</h2>
-        <p class="sub">We hold this on your card now and charge it when the job is finished.</p>
-        <div class="breakdown">
-          <div><span>${esc(bid.trade)}</span><span class="mono">${fmt(bid.bid)}</span></div>
-          <div><span>Swoop service fee</span><span class="mono">${fmt(bid.fee)}</span></div>
-          <div class="tot"><span>Held</span><span class="mono">${fmt(bid.charge)}</span></div>
+      <div class="veil">
+        <div class="sheet"
+             role="dialog"
+             aria-modal="true"
+             aria-label="Confirm booking">
+
+          <div class="grab"></div>
+
+          <h2>Book ${esc(approval.provider.name)}</h2>
+
+          <p class="sub">
+            Your approved total is charged now. Swoop reserves the captured
+            funds for job completion or cancellation.
+          </p>
+
+          <div class="breakdown">
+            <div>
+              <span>${esc(approval.provider.trade)}</span>
+              <span class="mono">
+                ${fmt(approval.breakdown.bidAmount)}
+              </span>
+            </div>
+
+            <div>
+              <span>Swoop service fee (7.5%)</span>
+              <span class="mono">
+                ${fmt(approval.breakdown.feeAmount)}
+              </span>
+            </div>
+
+            <div class="tot">
+              <span>Total charged and reserved</span>
+              <span class="mono">${fmt(total)}</span>
+            </div>
+          </div>
+
+          <div id="payslot"
+               style="margin-top:var(--s4);min-height:80px">
+            <div class="skel" style="height:46px"></div>
+          </div>
+
+          <div id="payerr"></div>
+
+          <button class="btn" id="paybtn" disabled>
+            Preparing…
+          </button>
+
+          <button class="btn btn-ghost" onclick="closeModal()">
+            Not yet
+          </button>
         </div>
-        <div id="payslot" style="margin-top:var(--s4);min-height:80px"><div class="skel" style="height:46px"></div></div>
-        <div id="payerr"></div>
-        <button class="btn" id="paybtn" disabled>Preparing…</button>
-        <button class="btn btn-ghost" onclick="closeModal()">Not yet</button>
-      </div></div>`;
+      </div>`;
+
     $('payslot').innerHTML = '';
-    const confirmFn = await mountPayment(a.clientSecret, 'payslot');
-    $('paybtn').disabled = false; $('paybtn').textContent = `Hold ${fmt(bid.charge)} and book`;
+
+    const confirmFn = await mountPayment(
+      payment.clientSecret,
+      'payslot'
+    );
+
+    $('paybtn').disabled = false;
+    $('paybtn').textContent = `Pay ${fmt(total)} and book`;
+
     $('paybtn').onclick = async () => {
-      $('paybtn').disabled = true; $('paybtn').textContent = 'Authorizing…';
+      $('paybtn').disabled = true;
+      $('paybtn').textContent = 'Processing payment…';
+      $('payerr').innerHTML = '';
+
       try {
+        // 3. Customer confirms the payment through Hyperswitch.
         await confirmFn();
-        const r = await api('POST', `/api/jobs/${S.job.id}/authorized`, {});
-        S.lastRouting = r.routing;
-        closeModal(); await loadJob(S.job.id); await refresh();
-        S.chat = [{ me: false, text: `Hi — got your ${S.job.service.toLowerCase()} job. I'll set off shortly.` }];
-        go('track'); toast(`${esc(bid.provider_name.split(' ')[0])} is booked. ${fmt(bid.charge)} held, not charged.`);
+
+        // 4. Server retrieves and verifies the external payment.
+        const result = await api(
+          'POST',
+          `/api/jobs/${S.job.id}/reconcile`,
+          {}
+        );
+
+        if (result.status !== 'verified') {
+          const reason =
+            result.reason ||
+            result.discrepancyReason ||
+            'Payment confirmation is still pending.';
+
+          throw new Error(reason);
+        }
+
+        closeModal();
+
+        await loadJob(S.job.id);
+        await refresh();
+
+        S.chat = [{
+          me: false,
+          state: 'RESERVED',
+          text:
+            `Hi — I accepted your ${S.job.service.toLowerCase()} job. ` +
+            `I haven't started travelling yet.`,
+        }];
+
+        S.busy = false;
+        go('track');
+
+        toast(
+          `${esc(approval.provider.name.split(' ')[0])} is booked. ` +
+          `${fmt(total)} was charged and reserved for this job.`
+        );
       } catch (err) {
-        $('payerr').innerHTML = `<div class="note bad"><b>${esc(err.message)}</b><br>Your job is still open — try another card or another bid.</div>`;
-        $('paybtn').disabled = false; $('paybtn').textContent = `Hold ${fmt(bid.charge)} and book`;
+        $('payerr').innerHTML = `
+          <div class="note bad">
+            <b>${esc(err.message)}</b><br>
+            Your job has not been confirmed. Try again or choose another payment method.
+          </div>`;
+
+        $('paybtn').disabled = false;
+        $('paybtn').textContent = `Pay ${fmt(total)} and book`;
       }
     };
-  } catch (e) { S.error = e.message; }
-  S.busy = false; render();
+  } catch (err) {
+    S.error = err.message;
+    toast(err.message);
+  } finally {
+    S.busy = false;
+    render();
+  }
+}
+
+function providerMessageForState(state) {
+  const firstName =
+    acceptedBid()?.provider_name?.split(' ')[0] || 'Your provider';
+
+  const messages = {
+    EN_ROUTE:
+      `${firstName}: I’m on my way now. You can follow my progress on the map.`,
+
+    ARRIVED:
+      `${firstName}: I’ve arrived at the job location. I’ll knock in a moment.`,
+
+    IN_PROGRESS:
+      `${firstName}: I’ve started working on the job.`,
+
+    COMPLETED:
+      `${firstName}: The work is complete. Please review everything when you’re ready.`,
+  };
+
+  return messages[state] || null;
 }
 
 async function advance() {
   S.busy = true; render();
   try {
-    const r = await api('POST', `/api/jobs/${S.job.id}/advance`, {});
+    const r = await api(
+    'POST',
+    `/api/jobs/${S.job.id}/advance`,
+    {}
+    );
     await loadJob(S.job.id); await refresh(); S.busy = false;
+    const providerMessage = providerMessageForState(r.state);
+
+    if (
+      providerMessage &&
+      !S.chat.some(message => message.state === r.state)
+    ) {
+    S.chat.push({
+      me: false,
+      state: r.state,
+      text: providerMessage,
+    });
+  }
     if (r.state === 'EN_ROUTE') {
       S.chat.push({ me: false, text: 'On my way now, about 20 minutes out.' });
       clearInterval(S.iv);
@@ -572,30 +908,88 @@ async function advance() {
         if (S.screen === 'track') render();
       }, 1200);
     }
-    if (r.state === 'ARRIVED') { S.van = { x: 70, y: 26 }; S.eta = 0; S.chat.push({ me: false, text: "Outside now — I'll knock." }); }
+    if (r.state === 'ARRIVED') { S.van = { x: 70, y: 26 }; S.eta = 0; }
+    if (r.state === 'IN_PROGRESS') {
+      clearInterval(S.iv);
+    }
     if (r.state === 'COMPLETED') { clearInterval(S.iv); return go('review'); }
     render(); say(STATE_LABEL[r.state]);
   } catch (e) { S.busy = false; toast(e.message); render(); }
 }
 
 function askCancel() {
-  const t = tier(S.job.state), bid = acceptedBid();
-  const charged = S.job.state === 'SCHEDULED' ? 0 : S.job.state === 'EN_ROUTE' ? (S.config.penalty ?? 3000) : bid.charge;
+  const t = tier(S.job.state);
+  const bid = acceptedBid();
+  const total = bid?.totalAmount ?? 0;
+
+  const retainedAmount =
+    S.job.state === 'IN_PROGRESS'
+      ? total
+      : ['EN_ROUTE', 'ARRIVED'].includes(S.job.state)
+        ? (S.config.penalty ?? 3000)
+        : 0;
+
+  const walletCredit = Math.max(0, total - retainedAmount);
+
+  const retainedLabel =
+    S.job.state === 'IN_PROGRESS'
+      ? 'Amount retained'
+      : 'Provider compensation';
+
+  const confirmLabel =
+    S.job.state === 'IN_PROGRESS'
+      ? 'Cancel with no wallet credit'
+      : retainedAmount > 0
+        ? 'Cancel and retain $30'
+        : 'Cancel and return the full amount';
+
   $('modal').innerHTML = `
-  <div class="veil"><div class="sheet" role="alertdialog" aria-modal="true" aria-label="Confirm cancellation">
-    <div class="grab"></div>
-    <h2>${charged === 0 ? 'Cancel this job?' : 'Are you sure?'}</h2>
-    <p class="sub">${t.detail}</p>
-    <div class="breakdown">
-      <div><span>Held on your card</span><span class="mono">${fmt(bid.charge)}</span></div>
-      <div><span>You'll be charged</span><span class="mono ${charged ? 'neg' : ''}">${fmt(charged)}</span></div>
-      <div class="tot"><span>Released</span><span class="mono pos">${fmt(bid.charge - charged)}</span></div>
-    </div>
-    <button class="btn ${charged ? 'btn-danger' : ''}" onclick="confirmCancel()">
-      ${charged ? 'Yes, cancel anyway' : 'Cancel and release the hold'}</button>
-    <button class="btn btn-ghost" onclick="closeModal()">Go back</button>
-  </div></div>`;
+    <div class="veil">
+      <div
+        class="sheet"
+        role="alertdialog"
+        aria-modal="true"
+        aria-label="Confirm cancellation">
+
+        <div class="grab"></div>
+
+        <h2>Cancel this job?</h2>
+        <p class="sub">${t.detail}</p>
+
+        <div class="breakdown">
+          <div>
+            <span>Originally charged</span>
+            <span class="mono">${fmt(total)}</span>
+          </div>
+
+          <div>
+            <span>${retainedLabel}</span>
+            <span class="mono ${retainedAmount > 0 ? 'neg' : ''}">
+              ${fmt(retainedAmount)}
+            </span>
+          </div>
+
+          <div class="tot">
+            <span>Credited to your Swoop wallet</span>
+            <span class="mono ${walletCredit > 0 ? 'pos' : ''}">
+              ${fmt(walletCredit)}
+            </span>
+          </div>
+        </div>
+
+        <button
+          class="btn ${retainedAmount > 0 ? 'btn-danger' : ''}"
+          onclick="confirmCancel()">
+          ${confirmLabel}
+        </button>
+
+        <button class="btn btn-ghost" onclick="closeModal()">
+          Go back
+        </button>
+      </div>
+    </div>`;
 }
+
 async function confirmCancel() {
   try {
     const r = await api('POST', `/api/jobs/${S.job.id}/cancel`, {});
@@ -603,13 +997,7 @@ async function confirmCancel() {
     toast(r.charged ? `Cancelled. ${fmt(r.charged)} charged.` : 'Cancelled. Nothing was charged.');
   } catch (e) { toast(e.message); }
 }
-async function providerCancel() {
-  try {
-    const r = await api('POST', `/api/jobs/${S.job.id}/provider-cancel`, {});
-    clearInterval(S.iv); await refresh(); S.job = null; go('jobs');
-    toast(`Provider cancelled. ${fmt(r.compensation)} added to your wallet.`);
-  } catch (e) { toast(e.message); }
-}
+
 async function finish() {
   S.busy = true; render();
   try {
@@ -663,7 +1051,7 @@ function render() {
 }
 
 Object.assign(window, { go, pick, openTopup, closeModal, submitJob, acceptBid, advance,
-  askCancel, confirmCancel, providerCancel, finish, sendMsg, openJob, withdraw, hint, S });
+  askCancel, confirmCancel, finish, sendMsg, openJob, withdraw, hint, S });
 
 (async function boot() {
   try {

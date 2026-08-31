@@ -140,6 +140,34 @@ export function cancelledEnRoute({ userId, jobId, providerId, paymentId, bidAmou
   ], { idempotencyKey: `${jobId}:settle`, paymentId, userId, jobId });
 }
 
+/**
+ * Cancelled after work has started.
+ *
+ * The customer receives no wallet credit. The complete reservation is allocated
+ * using the same provider-payout and marketplace-fee economics as a completed
+ * job, but it remains a distinct ledger reason for reporting and reconciliation.
+ */
+export function cancelledInProgress({
+  userId,
+  jobId,
+  providerId,
+  paymentId,
+  bidAmount,
+}) {
+  const e = economics(bidAmount);
+
+  return tx('CANCELLED_IN_PROGRESS', [
+    debit(jobReserved(jobId), e.charge),
+    credit(providerPayable(providerId), e.payout),
+    credit(PLATFORM_REVENUE, e.take),
+  ], {
+    idempotencyKey: `${jobId}:settle`,
+    paymentId,
+    userId,
+    jobId,
+  });
+}
+
 /* --------------------------------------------------------------- tips ----- */
 
 /** Tip from the separately funded wallet. The provider keeps all of it. */

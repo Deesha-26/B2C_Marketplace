@@ -19,6 +19,7 @@ export const STATES = {
   COMPLETED: 'COMPLETED',
   CANCELLED_PRE_TRAVEL: 'CANCELLED_PRE_TRAVEL',
   CANCELLED_EN_ROUTE: 'CANCELLED_EN_ROUTE',
+  CANCELLED_IN_PROGRESS: 'CANCELLED_IN_PROGRESS',
 };
 
 const NEXT = {
@@ -29,7 +30,12 @@ const NEXT = {
 export const nextState = state => NEXT[state] ?? null;
 
 export const isTerminal = s =>
-  [STATES.COMPLETED, STATES.CANCELLED_PRE_TRAVEL, STATES.CANCELLED_EN_ROUTE].includes(s);
+  [
+  STATES.COMPLETED,
+  STATES.CANCELLED_PRE_TRAVEL,
+  STATES.CANCELLED_EN_ROUTE,
+  STATES.CANCELLED_IN_PROGRESS,
+].includes(s);
 
 /**
  * Which cancellation applies.
@@ -40,7 +46,15 @@ export const isTerminal = s =>
  */
 export function cancellationTier(state) {
   if (state === STATES.RESERVED) return 'PRE_TRAVEL';
-  if ([STATES.EN_ROUTE, STATES.ARRIVED, STATES.IN_PROGRESS].includes(state)) return 'EN_ROUTE';
+
+  if ([STATES.EN_ROUTE, STATES.ARRIVED].includes(state)) {
+    return 'EN_ROUTE';
+  }
+
+  if (state === STATES.IN_PROGRESS) {
+    return 'IN_PROGRESS';
+  }
+
   return null;
 }
 
@@ -48,12 +62,43 @@ export function cancellationTier(state) {
 export function cancellationPreview(state, bidAmount) {
   const tier = cancellationTier(state);
   if (!tier) return null;
+
   const e = economics(bidAmount);
-  return tier === 'PRE_TRAVEL'
-    ? { tier, retainedByProvider: 0, returnedToWallet: e.charge,
-        summary: 'The provider has not set off. The full amount returns to your Swoop wallet.' }
-    : { tier, retainedByProvider: PENALTY, returnedToWallet: e.charge - PENALTY,
-        summary: `The provider is already travelling and keeps ${PENALTY / 100} as travel compensation. The rest returns to your Swoop wallet.` };
+
+  if (tier === 'PRE_TRAVEL') {
+    return {
+      tier,
+      retainedAmount: 0,
+      retainedByProvider: 0,
+      platformRevenue: 0,
+      returnedToWallet: e.charge,
+      summary:
+        'The provider has not set off. The full amount returns to your Swoop wallet.',
+    };
+  }
+
+  if (tier === 'EN_ROUTE') {
+    return {
+      tier,
+      retainedAmount: PENALTY,
+      retainedByProvider: PENALTY,
+      platformRevenue: 0,
+      returnedToWallet: e.charge - PENALTY,
+      summary:
+        `The provider has started travelling and receives ` +
+        `$${(PENALTY / 100).toFixed(2)}. The remainder returns to your Swoop wallet.`,
+    };
+  }
+
+  return {
+    tier: 'IN_PROGRESS',
+    retainedAmount: e.charge,
+    retainedByProvider: e.payout,
+    platformRevenue: e.take,
+    returnedToWallet: 0,
+    summary:
+      'Work has started. The full approved total is retained and allocated normally.',
+  };
 }
 
 /** Seeded providers. Round 1 has no provider onboarding or real bidding. */

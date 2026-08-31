@@ -88,6 +88,12 @@ export async function claim(db, {
 export const get = (db, operationKey) =>
   db.one('SELECT * FROM payment_operations WHERE operation_key = $1', [operationKey]);
 
+export const getByPaymentId = (db, paymentId) =>
+  db.one(
+    'SELECT * FROM payment_operations WHERE payment_id = $1',
+    [paymentId]
+  );
+
 /** Locks the row for the short local transaction that applies effects. */
 export const lock = (t, operationKey) =>
   t.one('SELECT * FROM payment_operations WHERE operation_key = $1 FOR UPDATE', [operationKey]);

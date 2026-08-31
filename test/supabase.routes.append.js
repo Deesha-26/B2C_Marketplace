@@ -369,27 +369,108 @@ describe('routes — cancellation', () => {
     assert.equal(await ledger.balance(`JOB_RESERVED:${jobId}`), 0);
   });
 
-  test('after travel begins the provider keeps exactly $30 and platform revenue is $0', async () => {
-    for (const state of [JOB.EN_ROUTE, JOB.ARRIVED, JOB.IN_PROGRESS]) {
+  test('en route or arrived: provider receives $30 and platform receives $0', async () => {
+    for (const state of [JOB.EN_ROUTE, JOB.ARRIVED]) {
       await fundWallet();
+
       const { jobId, bid, approval } = await bookJob();
       await advanceTo(jobId, state);
 
-      const providerBefore = await ledger.balance(`PROVIDER_PAYABLE:${bid.provider_id}`);
-      const platformBefore = await ledger.balance('PLATFORM_REVENUE');
-      const walletBefore = (await api('GET', '/api/me')).body.wallet;
+      const providerBefore =
+        await ledger.balance(`PROVIDER_PAYABLE:${bid.provider_id}`);
 
-      const r = await api('POST', `/api/jobs/${jobId}/cancel`, {});
-      assert.equal(r.body.tier, 'EN_ROUTE', state);
-      assert.equal(r.body.retainedByProvider, PENALTY, state);
-      assert.equal(await ledger.balance(`PROVIDER_PAYABLE:${bid.provider_id}`),
-        providerBefore + PENALTY, state);
-      assert.equal(await ledger.balance('PLATFORM_REVENUE'), platformBefore, state);
-      assert.equal((await api('GET', '/api/me')).body.wallet,
-        walletBefore + approval.breakdown.totalAmount - PENALTY, state);
-      assert.equal(await ledger.balance(`JOB_RESERVED:${jobId}`), 0, state);
-    }
-  });
+      const platformBefore =
+        await ledger.balance('PLATFORM_REVENUE');
+
+      const walletBefore =
+        (await api('GET', '/api/me')).body.wallet;
+
+      const r = await api(
+      'POST',
+      `/api/jobs/${jobId}/cancel`,
+      {}
+    );
+
+    assert.equal(r.body.tier, 'EN_ROUTE', state);
+    assert.equal(r.body.retainedAmount, PENALTY, state);
+    assert.equal(r.body.retainedByProvider, PENALTY, state);
+    assert.equal(r.body.platformRevenue, 0, state);
+
+    assert.equal(
+      await ledger.balance(`PROVIDER_PAYABLE:${bid.provider_id}`),
+      providerBefore + PENALTY,
+      state
+    );
+
+    assert.equal(
+      await ledger.balance('PLATFORM_REVENUE'),
+      platformBefore,
+      state
+    );
+
+    assert.equal(
+      (await api('GET', '/api/me')).body.wallet,
+      walletBefore + approval.breakdown.totalAmount - PENALTY,
+      state
+    );
+
+    assert.equal(
+      await ledger.balance(`JOB_RESERVED:${jobId}`),
+      0,
+      state
+    );
+  }
+});
+
+  test('in progress: full charge is allocated with no wallet credit', async () => {
+    await fundWallet();
+
+    const { jobId, bid, approval } = await bookJob();
+    await advanceTo(jobId, JOB.IN_PROGRESS);
+
+    const e = economics(bid.amount);
+
+    const providerBefore =
+      await ledger.balance(`PROVIDER_PAYABLE:${bid.provider_id}`);
+
+    const platformBefore =
+      await ledger.balance('PLATFORM_REVENUE');
+
+    const walletBefore =
+      (await api('GET', '/api/me')).body.wallet;
+
+    const r = await api(
+    'POST',
+    `/api/jobs/${jobId}/cancel`,
+    {}
+  );
+
+  assert.equal(r.body.tier, 'IN_PROGRESS');
+  assert.equal(r.body.retainedAmount, approval.breakdown.totalAmount);
+  assert.equal(r.body.retainedByProvider, e.payout);
+  assert.equal(r.body.creditedToWallet, 0);
+  assert.equal(r.body.platformRevenue, e.take);
+
+  assert.equal(
+    await ledger.balance(`PROVIDER_PAYABLE:${bid.provider_id}`),
+    providerBefore + e.payout
+  );
+
+  assert.equal(
+    await ledger.balance('PLATFORM_REVENUE'),
+    platformBefore + e.take
+  );
+
+  assert.equal(
+    (await api('GET', '/api/me')).body.wallet,
+    walletBefore
+  );
+
+  assert.equal(
+    await ledger.balance(`JOB_RESERVED:${jobId}`),
+    0
+  );
+});
 
   test('cancelling twice does not double-credit', async () => {
     await fundWallet();
@@ -604,7 +685,12 @@ describe('routes — global invariants', () => {
   test('no reserved balance is left on a terminal job', async () => {
     const rows = await db.all(
       `SELECT j.id FROM jobs j
-       WHERE j.state IN ('COMPLETED','CANCELLED_PRE_TRAVEL','CANCELLED_EN_ROUTE')`);
+       WHERE j.state IN (
+  'COMPLETED',
+  'CANCELLED_PRE_TRAVEL',
+  'CANCELLED_EN_ROUTE',
+  'CANCELLED_IN_PROGRESS'
+)`);
     for (const { id } of rows) {
       assert.equal(await ledger.balance(`JOB_RESERVED:${id}`), 0, id);
     }

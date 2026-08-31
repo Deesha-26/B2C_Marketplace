@@ -254,18 +254,36 @@ describe('job lifecycle', () => {
     assert.equal(p.returnedToWallet, economics(9000).charge);
   });
 
-  test('cancellation after travel begins retains exactly $30, in every travelling state', () => {
-    for (const s of [JOB.EN_ROUTE, JOB.ARRIVED, JOB.IN_PROGRESS]) {
-      const p = cancellationPreview(s, 9000);
-      assert.equal(p.tier, 'EN_ROUTE', s);
-      assert.equal(p.retainedByProvider, PENALTY, s);
-      assert.equal(p.returnedToWallet, economics(9000).charge - PENALTY, s);
-    }
-  });
+  test('en-route and arrived cancellations retain exactly $30', () => {
+  for (const state of [JOB.EN_ROUTE, JOB.ARRIVED]) {
+    const p = cancellationPreview(state, 9000);
+
+    assert.equal(p.tier, 'EN_ROUTE', state);
+    assert.equal(p.retainedAmount, PENALTY, state);
+    assert.equal(p.retainedByProvider, PENALTY, state);
+    assert.equal(p.platformRevenue, 0, state);
+    assert.equal(
+      p.returnedToWallet,
+      economics(9000).charge - PENALTY,
+      state
+    );
+  }
+});
+
+test('in-progress cancellation retains the full charge', () => {
+  const e = economics(9000);
+  const p = cancellationPreview(JOB.IN_PROGRESS, 9000);
+
+  assert.equal(p.tier, 'IN_PROGRESS');
+  assert.equal(p.retainedAmount, e.charge);
+  assert.equal(p.retainedByProvider, e.payout);
+  assert.equal(p.platformRevenue, e.take);
+  assert.equal(p.returnedToWallet, 0);
+});
 
   test('terminal and pre-payment states cannot be cancelled', () => {
     for (const s of [JOB.OPEN_FOR_BIDS, JOB.APPROVED, JOB.COMPLETED,
-                     JOB.CANCELLED_PRE_TRAVEL, JOB.CANCELLED_EN_ROUTE]) {
+                     JOB.CANCELLED_PRE_TRAVEL, JOB.CANCELLED_EN_ROUTE, JOB.CANCELLED_IN_PROGRESS]) {
       assert.equal(cancellationTier(s), null, s);
     }
   });

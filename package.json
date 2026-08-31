@@ -8,9 +8,9 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "start": "node --experimental-sqlite server/index.js",
+    "start": "node --env-file=.env server/index.js",
     "dev": "node --watch --experimental-sqlite server/index.js",
-    "test": "node --experimental-sqlite --test test/*.test.js",
+    "test": "node --test test/*.test.js",
     "test:core": "node --experimental-sqlite --test test/core.test.js",
     "test:api": "node --experimental-sqlite --test test/api.test.js",
     "test:client": "node --experimental-sqlite --test test/client.test.js",
@@ -24,7 +24,7 @@
     "test:supabase": "node --env-file=.env --test test/supabase.smoke.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
+    "express": "^4.22.2",
     "pg": "^8.23.0"
   },
   "keywords": [

@@ -6,8 +6,20 @@ import { createPostgres } from './postgres.js';
  */
 export async function open(opts = {}) {
   const url = opts.url ?? process.env.DATABASE_URL;
-  if (!url) throw new Error('DATABASE_URL is not set — point it at the Supabase transaction pooler (port 6543)');
-  return createPostgres(url);
+
+  if (!url) {
+    throw new Error(
+      'DATABASE_URL is not set — point it at the Supabase transaction pooler (port 6543)'
+    );
+  }
+
+  return createPostgres(url, {
+    migrate: opts.migrate,
+    searchPath:
+      opts.searchPath ??
+      process.env.DB_SEARCH_PATH ??
+      undefined,
+  });
 }
 
 /**
