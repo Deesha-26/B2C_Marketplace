@@ -596,6 +596,11 @@ app.post('/api/wallet/withdraw', wrap(async (req, res) => {
 export function start(port = process.env.PORT || 3000) {
   return app.listen(port, () => console.log(`Swoop on http://localhost:${port}`));
 }
-if (process.env.SWOOP_AUTOSTART !== 'false') start();
+if (
+  process.env.VERCEL !== '1' &&
+  process.env.SWOOP_AUTOSTART !== 'false'
+) {
+  start();
+}
 
 export { app, db, ledger, flow };

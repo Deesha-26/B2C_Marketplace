@@ -1,7 +1,7 @@
 {
   "name": "swoop",
   "version": "1.0.0",
-  "description": "B2C home-services marketplace demonstrating a full payment lifecycle on Hyperswitch: authorize, capture, partial capture, void, refund, extended authorization, webhooks and a double-entry ledger.",
+  "description": "Round 1 B2C home-services marketplace prototype demonstrating Hyperswitch sandbox payment orchestration, automatic rerouting, automatic capture, reconciliation, webhooks and a Supabase double-entry marketplace ledger.",
   "type": "module",
   "license": "MIT",
   "engines": {
