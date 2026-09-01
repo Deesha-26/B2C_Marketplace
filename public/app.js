@@ -248,7 +248,7 @@ V.bids = () => {
         <div class="who">
           <span class="avatar v${(i % 3) + 1}">${initials(b.provider_name)}</span>
           <span><b>${esc(b.trade)}</b><br>
-            <span class="sub">${esc(b.provider_name)} · ★ ${b.rating} · ${b.jobs_done} jobs</span></span>
+            <span class="sub">${esc(b.provider_name)} · ★ ${b.rating}${b.jobs_done != null ? ` · ${b.jobs_done} jobs` : ''}</span></span>
         </div>
         <span class="mono" style="font-weight:700">${fmt(b.totalAmount)}</span>
       </div>
@@ -383,7 +383,7 @@ V.wallet = () => `
     <div class="trail">${S.lastRouting.map(a => `
       <div class="trail-row ${a.errorCode ? 'no' : 'ok'}">
         <span class="trail-n">${a.n}</span>
-        <span><b>${esc(a.connector || 'unknown')}</b>${a.errorCode ? ` — ${esc(a.errorCode)}` : ' — succeeded'}</span>
+        <span><b>${esc(a.processor || 'unknown')}</b>${a.errorCode ? ` — ${esc(a.errorCode)}` : ' — succeeded'}</span>
       </div>`).join('')}</div>
     <p class="sub">Swoop doesn\u2019t pick the processor. Hyperswitch routes it, and retries elsewhere if the first declines.</p>` : ''}
 
@@ -392,7 +392,7 @@ V.wallet = () => `
     ${S.activity.length === 0 ? '<p class="sub">Nothing yet.</p>' : S.activity.map(e => `
       <div class="e"><span>${esc(label(e.reason))}<br>
         <span class="sub mono" style="font-size:11px">${new Date(e.at).toLocaleString()}</span></span>
-        <span class="mono ${e.delta < 0 ? 'neg' : e.delta > 0 ? 'pos' : ''}">${e.delta ? fmt(e.delta) : '—'}</span></div>`).join('')}
+        <span class="mono ${e.walletDelta < 0 ? 'neg' : e.walletDelta > 0 ? 'pos' : ''}">${e.walletDelta ? fmt(e.walletDelta) : '—'}</span></div>`).join('')}
   </div>
 </div>`;
 
@@ -414,9 +414,12 @@ const jobCard = j => `
   </button>`;
 
 const label = r => ({
-  WALLET_TOPUP: 'Wallet topped up', JOB_AUTHORIZED: 'Payment captured and reserved', JOB_CAPTURED: 'Job funds allocated',
+  WALLET_TOPUP: 'Wallet topped up', JOB_CAPTURED_AND_RESERVED: 'Payment captured and reserved',
+  JOB_COMPLETED: 'Job funds allocated',
   JOB_SETTLED: 'Job settled', TIP: 'Tip', WITHDRAWAL_SIMULATED: 'Withdrawal to card simulated',
-  CANCELLED_PRE_ENROUTE: 'Cancelled — hold released', CANCEL_CAPTURE: 'Cancellation charge',
+  CANCELLED_PRE_TRAVEL: 'Cancelled — full amount returned',
+  CANCELLED_EN_ROUTE: 'Cancelled — provider travel compensation',
+  CANCELLED_IN_PROGRESS: 'Cancelled — job allocated',
   CANCEL_SETTLE: 'Cancellation settled', PROVIDER_CANCELLED: 'Provider cancelled',
   PROVIDER_PENALTY: 'Compensation received', REFUND_SETTLED: 'Refund settled',
 }[r] || r);
@@ -556,6 +559,10 @@ const pick = s => { S.draft.service = s; render(); };
 let hyper = null, widgets = null, unified = null;
 
 async function mountPayment(clientSecret, mountId, onDone) {
+  if (!S.config.paymentReady || !S.config.publishableKey) {
+    throw new Error('Card payments are not configured. Set HYPERSWITCH_PUBLISHABLE_KEY and reload.');
+  }
+  if (!clientSecret) throw new Error('Payment setup did not return a client secret.');
   hyper ??= Hyper(S.config.publishableKey);
   widgets = hyper.widgets({
   appearance: { theme: 'default' },
@@ -648,12 +655,13 @@ function openTopup() {
 
 async function withdraw() {
   try {
-    const r = await api('POST', '/api/wallet/withdraw', {
-      amount: S.withdrawable,
+    const amount = S.withdrawable;
+    await api('POST', '/api/wallet/withdraw', {
+      amount,
       withdrawalId: crypto.randomUUID(),
     });
     await refresh(); render();
-    toast(`${fmt(r.refunds.reduce((s, x) => s + x.amount, 0))} refunded to your card.`);
+    toast(`${fmt(amount)} withdrawal recorded. No card refund was sent in this demo.`);
   } catch (e) { toast(e.message); }
 }
 const closeModal = () => { $('modal').innerHTML = ''; };
@@ -880,9 +888,10 @@ function providerMessageForState(state) {
 async function advance() {
   S.busy = true; render();
   try {
+    const action = S.job.state === 'IN_PROGRESS' ? 'complete' : 'advance';
     const r = await api(
     'POST',
-    `/api/jobs/${S.job.id}/advance`,
+    `/api/jobs/${S.job.id}/${action}`,
     {}
     );
     await loadJob(S.job.id); await refresh(); S.busy = false;
@@ -1001,7 +1010,10 @@ async function confirmCancel() {
 async function finish() {
   S.busy = true; render();
   try {
-    if (S.tip > 0) await api('POST', `/api/jobs/${S.job.id}/tip`, { amount: S.tip });
+    if (S.tip > 0) await api('POST', `/api/jobs/${S.job.id}/tip`, {
+      amount: S.tip,
+      tipId: crypto.randomUUID(),
+    });
     await refresh(); S.busy = false; S.job = null; S.rating = 0;
     const tipped = S.tip; S.tip = 0; go('jobs');
     toast(tipped ? `Review posted and ${fmt(tipped)} tipped.` : 'Review posted. Thanks.');

@@ -130,6 +130,7 @@ const walletOf = userId => ledger.balance(customerWallet(userId));
 /* ============================================================ 1. config === */
 app.get('/api/config', (req, res) => res.json({
   publishableKey: hs.publishableKey(),
+  paymentReady: Boolean(hs.publishableKey()),
   walletFloor: WALLET_FLOOR,
   minTopUp: MIN_TOPUP,
   travelCompensation: PENALTY,
@@ -218,7 +219,9 @@ app.post('/api/jobs', wrap(async (req, res) => {
   if (!service) fail(400, 'Choose a service.');
   if (!description || description.trim().length < 8) fail(400, 'Describe the job in a sentence or two.');
   if (!address) fail(400, 'Enter the job location.');
-  if (!scheduledFor || Number.isNaN(Date.parse(scheduledFor))) fail(400, 'Choose a date and time.');
+  const scheduledAt = Date.parse(scheduledFor);
+  if (!scheduledFor || Number.isNaN(scheduledAt)) fail(400, 'Choose a date and time.');
+  if (scheduledAt <= Date.now()) fail(400, 'Choose a future date and time.');
 
   const jobId = uid('job');
   await db.transaction(async t => {
@@ -292,29 +295,50 @@ app.get('/api/jobs/:id', wrap(async (req, res) => {
  */
 app.post('/api/jobs/:id/approve', wrap(async (req, res) => {
   const u = await userOf(req);
-  const job = await mustJob(req, u);
-  if (![STATES.OPEN_FOR_BIDS, STATES.APPROVED].includes(job.state)) {
-    fail(409, `This job is already ${job.state}.`);
-  }
-  const bid = await db.one('SELECT * FROM bids WHERE id = $1 AND job_id = $2',
-    [req.body.bidId, job.id]);
-  if (!bid) fail(404, 'That bid is not on this job.');
+  const outcome = await db.transaction(async t => {
+    const job = await t.one('SELECT * FROM jobs WHERE id = $1 AND user_id = $2 FOR UPDATE',
+      [req.params.id, u.id]);
+    if (!job) fail(404, 'Job not found.');
+    const bid = await t.one('SELECT * FROM bids WHERE id = $1 AND job_id = $2',
+      [req.body.bidId, job.id]);
+    if (!bid) fail(404, 'That bid is not on this job.');
 
-  const e = economics(bid.amount);
-  const approvalId = uid('appr');
-  await db.transaction(async t => {
+    // Approval is the chargeable consent.  Reusing the same bid is idempotent;
+    // choosing another one requires cancelling/reposting instead of leaving two
+    // independently chargeable approvals on the same job.
+    if (job.state === STATES.APPROVED) {
+      if (job.accepted_bid_id !== bid.id) {
+        fail(409, 'A bid is already approved for this job.');
+      }
+      const existing = await t.one(
+        'SELECT * FROM approvals WHERE job_id = $1 AND bid_id = $2 ORDER BY approved_at DESC LIMIT 1',
+        [job.id, bid.id]);
+      if (!existing) throw new Error('Approved job has no approval record.');
+      return { approval: existing, bid, existing: true };
+    }
+    if (job.state !== STATES.OPEN_FOR_BIDS) fail(409, `This job is already ${job.state}.`);
+
+    const e = economics(bid.amount);
+    const approval = {
+      id: uid('appr'), job_id: job.id, bid_id: bid.id,
+      bid_amount: e.bid, fee_amount: e.fee, total_amount: e.charge, currency: 'USD',
+    };
     await t.none(
       `INSERT INTO approvals (id,job_id,bid_id,bid_amount,fee_amount,total_amount,currency)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [approvalId, job.id, bid.id, e.bid, e.fee, e.charge, 'USD']);
+      [approval.id, approval.job_id, approval.bid_id, approval.bid_amount,
+       approval.fee_amount, approval.total_amount, approval.currency]);
     await t.none('UPDATE jobs SET state = $2, accepted_bid_id = $3 WHERE id = $1',
       [job.id, STATES.APPROVED, bid.id]);
+    return { approval, bid, existing: false };
   });
 
   res.json({
-    approvalId,
-    breakdown: { bidAmount: e.bid, feeAmount: e.fee, totalAmount: e.charge, currency: 'USD' },
-    provider: { id: bid.provider_id, name: bid.provider_name, trade: bid.trade },
+    approvalId: outcome.approval.id,
+    alreadyApproved: outcome.existing,
+    breakdown: { bidAmount: Number(outcome.approval.bid_amount), feeAmount: Number(outcome.approval.fee_amount),
+                 totalAmount: Number(outcome.approval.total_amount), currency: outcome.approval.currency },
+    provider: { id: outcome.bid.provider_id, name: outcome.bid.provider_name, trade: outcome.bid.trade },
   });
 }));
 
@@ -327,6 +351,7 @@ app.post('/api/jobs/:id/pay', wrap(async (req, res) => {
   const approval = await db.one('SELECT * FROM approvals WHERE id = $1 AND job_id = $2',
     [req.body.approvalId, job.id]);
   if (!approval) fail(404, 'That approval does not belong to this job.');
+  if (approval.bid_id !== job.accepted_bid_id) fail(409, 'That approval is no longer active.');
 
   const started = await flow.start({
     operationKey: jobPaymentKey(job.id, approval.id),
@@ -357,7 +382,8 @@ app.post('/api/jobs/:id/reconcile', wrap(async (req, res) => {
   const u = await userOf(req);
   const job = await mustJob(req, u);
   const approval = await db.one(
-    'SELECT * FROM approvals WHERE job_id = $1 ORDER BY approved_at DESC LIMIT 1', [job.id]);
+    'SELECT * FROM approvals WHERE job_id = $1 AND bid_id = $2 ORDER BY approved_at DESC LIMIT 1',
+    [job.id, job.accepted_bid_id]);
   if (!approval) fail(409, 'This job has no approval to reconcile.');
 
   const result = await flow.reconcile({
@@ -367,8 +393,9 @@ app.post('/api/jobs/:id/reconcile', wrap(async (req, res) => {
   if (result.status === 'forbidden') fail(403, 'That operation belongs to another account.');
 
   // Only verified external capture moves the job forward.
-  if (result.status === 'verified' && job.state === STATES.APPROVED) {
-    await db.none('UPDATE jobs SET state = $2 WHERE id = $1', [job.id, STATES.RESERVED]);
+  if (['verified', 'already_completed'].includes(result.status) && job.state === STATES.APPROVED) {
+    await db.none('UPDATE jobs SET state = $2 WHERE id = $1 AND state = $3',
+      [job.id, STATES.RESERVED, STATES.APPROVED]);
   }
   const after = await db.one('SELECT state FROM jobs WHERE id = $1', [job.id]);
   res.json({ ...result, jobState: after.state });
@@ -398,18 +425,21 @@ app.get('/api/jobs/:id/attempts', wrap(async (req, res) => {
 /* ========================================================= 11. advance === */
 app.post('/api/jobs/:id/advance', wrap(async (req, res) => {
   const u = await userOf(req);
-  const job = await mustJob(req, u);
-  const next = nextState(job.state);
-  if (!next) fail(409, `Cannot advance a job that is ${job.state}.`);
-
-  await db.transaction(async t => {
+  const result = await db.transaction(async t => {
+    const job = await t.one('SELECT * FROM jobs WHERE id = $1 AND user_id = $2 FOR UPDATE',
+      [req.params.id, u.id]);
+    if (!job) fail(404, 'Job not found.');
+    const next = nextState(job.state);
+    if (!next) fail(409, `Cannot advance a job that is ${job.state}.`);
     await t.none('UPDATE jobs SET state = $2 WHERE id = $1', [job.id, next]);
     await t.none('INSERT INTO job_events (job_id, kind, simulated) VALUES ($1,$2,TRUE)',
       [job.id, next]);
+    const bid = job.accepted_bid_id
+      ? await t.one('SELECT * FROM bids WHERE id = $1', [job.accepted_bid_id]) : null;
+    return { next, bid };
   });
-  const bid = await acceptedBid({ ...job, state: next });
-  res.json({ state: next, simulated: true,
-             cancellation: bid ? cancellationPreview(next, bid.amount) : null });
+  res.json({ state: result.next, simulated: true,
+             cancellation: result.bid ? cancellationPreview(result.next, result.bid.amount) : null });
 }));
 
 /* ======================================================== 12. complete === */
@@ -429,6 +459,11 @@ app.post('/api/jobs/:id/complete', wrap(async (req, res) => {
   // the internal reservation.
   const e = economics(bid.amount);
   const out = await db.transaction(async t => {
+    const locked = await t.one('SELECT state FROM jobs WHERE id = $1 AND user_id = $2 FOR UPDATE',
+      [job.id, u.id]);
+    if (!locked || locked.state !== STATES.IN_PROGRESS) {
+      fail(409, 'This job changed before completion could be recorded.');
+    }
     await t.none('UPDATE jobs SET state = $2 WHERE id = $1', [job.id, STATES.COMPLETED]);
     await t.none('INSERT INTO job_events (job_id, kind, simulated) VALUES ($1,$2,TRUE)',
       [job.id, STATES.COMPLETED]);
@@ -528,6 +563,11 @@ app.post('/api/jobs/:id/cancel', wrap(async (req, res) => {
   }
 
   const out = await db.transaction(async t => {
+    const locked = await t.one('SELECT state FROM jobs WHERE id = $1 AND user_id = $2 FOR UPDATE',
+      [job.id, u.id]);
+    if (!locked || cancellationTier(locked.state) !== tier) {
+      fail(409, 'This job changed before cancellation could be recorded.');
+    }
     await t.none(
       'UPDATE jobs SET state = $2 WHERE id = $1',
       [job.id, state]

@@ -23,8 +23,8 @@ const BID = 9000;                      // $90.00
 const E = economics(BID);              // charge 9675, payout 7650, take 2025
 
 /** Net movement on one account across a transaction. */
-const on = (t, account) =>
-  t.entries.filter(e => e.account === account).reduce((s, e) => s + signed(e), 0);
+const on = (t, account) => 0 -
+  t.entries.filter(e => e.account === account).reduce((s, e) => s - signed(e), 0);
 
 const ALL = [
   ['walletTopUp',        walletTopUp({ userId: U, amount: 2500, paymentId: PAY })],
@@ -294,7 +294,7 @@ test('in-progress cancellation balances at awkward amounts', () => {
 
     assert.equal(
       on(t, PLATFORM_REVENUE),
-      -e.take,
+      0 - e.take,
       `bid=${bid}: platform revenue`
     );
   }

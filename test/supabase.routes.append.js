@@ -268,7 +268,7 @@ describe('routes — approval is not authorization', () => {
     assert.equal(Number(row.fee_amount), e.fee);
   });
 
-  test('re-approving a different bid writes a new approval and a new operation', async () => {
+  test('repeating the same approval is idempotent and a different bid is refused', async () => {
     await fundWallet();
     const created = await api('POST', '/api/jobs', {
       service: 'Plumbing', description: 'Kitchen tap dripping steadily',
@@ -276,12 +276,13 @@ describe('routes — approval is not authorization', () => {
     const jobId = created.body.id;
     const d = await api('GET', `/api/jobs/${jobId}`);
     const first = await api('POST', `/api/jobs/${jobId}/approve`, { bidId: d.body.bids[0].id });
+    const repeat = await api('POST', `/api/jobs/${jobId}/approve`, { bidId: d.body.bids[0].id });
     const second = await api('POST', `/api/jobs/${jobId}/approve`, { bidId: d.body.bids[1].id });
-    assert.notEqual(first.body.approvalId, second.body.approvalId);
-    assert.notEqual(jobPaymentKey(jobId, first.body.approvalId),
-                    jobPaymentKey(jobId, second.body.approvalId));
+    assert.equal(repeat.body.approvalId, first.body.approvalId);
+    assert.equal(repeat.body.alreadyApproved, true);
+    assert.equal(second.status, 409);
     const rows = await db.all('SELECT id FROM approvals WHERE job_id = $1', [jobId]);
-    assert.equal(rows.length, 2, 'the earlier approval must not be mutated');
+    assert.equal(rows.length, 1, 'a job has exactly one chargeable approval');
   });
 
   test('paying before approving is refused', async () => {

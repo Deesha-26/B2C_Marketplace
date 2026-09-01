@@ -10,7 +10,7 @@ Customer ──pay──▶ Swoop (merchant of record) ──settle──▶ Pro
               refund ◀─┘           └─▶ dispute
 ```
 
-**135 tests.** No build step, no framework, two dependencies — Express, and Node 22's built-in SQLite.
+No build step and two runtime dependencies — Express and PostgreSQL.
 
 ---
 
@@ -118,17 +118,15 @@ Whether a given decline is retried depends on the **GSM (Gateway Status Mapping)
 ## Tests
 
 ```bash
-npm test              # all 135
-npm run test:journey  # one customer, seven jobs, money reconciled at every step
+npm test              # fast unit and static checks
+npm run test:supabase # database-backed API and payment-flow checks
 ```
 
 | Suite | Covers |
 |---|---|
-| `core.test.js` | Money, ledger, risk, strategy, settlement, webhook safety |
-| `api.test.js` | All 33 routes over real HTTP against a fake Hyperswitch |
-| `client.test.js` | The real `public/app.js` run in a VM against the real server |
-| `static.test.js` | CSS classes, element ids, screen reachability, no keys in the client |
-| `journey.test.js` | One continuous session; asserts nothing is created or destroyed |
+| `postings.test.js`, `step3.test.js` | Money, ledger, payment verification and state-machine rules |
+| `supabase.smoke.js` | Routes over real HTTP against a fake Hyperswitch |
+| `static.test.js` | Client wiring checks |
 
 The suite never touches the real sandbox — only `npm run verify` does. CI runs on Node 22 and 24 and fails the build if a live-looking key is ever committed.
 
