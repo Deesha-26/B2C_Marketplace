@@ -560,7 +560,8 @@ let hyper = null, widgets = null, unified = null;
 
 async function mountPayment(clientSecret, mountId, onDone) {
   if (!S.config.paymentReady || !S.config.publishableKey) {
-    throw new Error('Card payments are not configured. Set HYPERSWITCH_PUBLISHABLE_KEY and reload.');
+    throw new Error(S.config.paymentConfigurationError ||
+      'Card payments are not configured. Set HYPERSWITCH_PUBLISHABLE_KEY and reload.');
   }
   if (!clientSecret) throw new Error('Payment setup did not return a client secret.');
   hyper ??= Hyper(S.config.publishableKey);
@@ -1069,6 +1070,12 @@ Object.assign(window, { go, pick, openTopup, closeModal, submitJob, acceptBid, a
   try {
     S.config = await api('GET', '/api/config');
     if (USER) await refresh(); else S.loading = false;
-  } catch (e) { S.loading = false; toast('Could not reach Swoop. Is the server running?'); }
+  } catch (e) {
+    S.loading = false;
+    const message = e.status >= 500
+      ? 'Swoop API is unavailable. Configure DATABASE_URL in Vercel, then redeploy.'
+      : 'Could not reach Swoop. Check the deployment and your connection.';
+    toast(message);
+  }
   render();
 })();

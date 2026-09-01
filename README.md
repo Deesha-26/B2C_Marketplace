@@ -24,11 +24,29 @@ npm run verify              # checks your sandbox is configured correctly
 npm start                   # http://localhost:3000
 ```
 
-Node 22.5+ is required (`node:sqlite` ships with it, so there is no native module to compile).
+Node 22.5+ is required.
 
 `npm run verify` is the thing to run first — it exercises every operation the app depends on against **your** sandbox and prints exactly what came back. It answers, in about thirty seconds, whether manual capture, partial capture, extended authorization and retries behave on your account the way this app assumes.
 
 Full dashboard walkthrough: [docs/HYPERSWITCH-SETUP.md](docs/HYPERSWITCH-SETUP.md).
+
+### Vercel deployment
+
+The frontend can load even when the API function fails. Before deploying, add
+these environment variables in **Vercel → Project → Settings → Environment
+Variables** for the Production environment, then redeploy:
+
+```text
+DATABASE_URL=<Supabase transaction-pooler URL on port 6543>
+HYPERSWITCH_SECRET_KEY=<sandbox secret key>
+HYPERSWITCH_PUBLISHABLE_KEY=<sandbox publishable key>
+HYPERSWITCH_PROFILE_ID=<business profile id>
+HYPERSWITCH_PAYMENT_RESPONSE_HASH_KEY=<webhook hash key>
+```
+
+`HYPERSWITCH_BASE_URL` is optional; if set, it must be exactly a full HTTPS URL
+such as `https://sandbox.hyperswitch.io`. Without `DATABASE_URL`, the server
+cannot initialize and `/api/config` returns a 500.
 
 ---
 

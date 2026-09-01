@@ -130,7 +130,8 @@ const walletOf = userId => ledger.balance(customerWallet(userId));
 /* ============================================================ 1. config === */
 app.get('/api/config', (req, res) => res.json({
   publishableKey: hs.publishableKey(),
-  paymentReady: Boolean(hs.publishableKey()),
+  paymentReady: hs.isConfigured(),
+  paymentConfigurationError: hs.configurationError(),
   walletFloor: WALLET_FLOOR,
   minTopUp: MIN_TOPUP,
   travelCompensation: PENALTY,

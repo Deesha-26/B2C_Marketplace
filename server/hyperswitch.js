@@ -16,6 +16,28 @@ const BASE = process.env.HYPERSWITCH_BASE_URL || 'https://sandbox.hyperswitch.io
 const KEY = process.env.HYPERSWITCH_SECRET_KEY;
 const PROFILE = process.env.HYPERSWITCH_PROFILE_ID;
 
+/**
+ * Validate configuration before attempting a network request.  Node's fetch
+ * otherwise leaks the unhelpful "Invalid URL" error when a deployment has a
+ * bare hostname (or other malformed value) in HYPERSWITCH_BASE_URL.
+ */
+export function configurationError() {
+  if (!KEY) return 'HYPERSWITCH_SECRET_KEY is not configured.';
+  if (!PROFILE) return 'HYPERSWITCH_PROFILE_ID is not configured.';
+  if (!process.env.HYPERSWITCH_PUBLISHABLE_KEY) {
+    return 'HYPERSWITCH_PUBLISHABLE_KEY is not configured.';
+  }
+  try {
+    const url = new URL(BASE);
+    if (url.protocol !== 'https:') return 'HYPERSWITCH_BASE_URL must use https.';
+  } catch {
+    return 'HYPERSWITCH_BASE_URL must be a full https URL, for example https://sandbox.hyperswitch.io.';
+  }
+  return null;
+}
+
+export const isConfigured = () => configurationError() === null;
+
 export class HyperswitchError extends Error {
   constructor(status, body) {
     const e = body?.error ?? {};
@@ -28,7 +50,8 @@ export class HyperswitchError extends Error {
 }
 
 async function call(method, path, body) {
-  if (!KEY) throw new Error('HYPERSWITCH_SECRET_KEY is not set');
+  const configError = configurationError();
+  if (configError) throw new Error(`Payment configuration error: ${configError}`);
   const res = await fetch(`${BASE}${path}`, {
     method,
     headers: { 'api-key': KEY, 'Content-Type': 'application/json', Accept: 'application/json' },
