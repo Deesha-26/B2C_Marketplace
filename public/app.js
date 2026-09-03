@@ -377,6 +377,7 @@ V.wallet = () => `
   ${S.wallet > 0 ? `<button class="btn btn-ghost" onclick="withdraw()">
   Withdraw to card <span class="sub">(simulated)</span>
 </button>` : ''}
+  <button class="btn btn-quiet" onclick="signOut()">Sign out</button>
 
   ${S.lastRouting?.length ? `
     <div class="sectionhead"><h3>How your last payment was routed</h3></div>
@@ -502,6 +503,7 @@ async function signIn() {
 }
 
 function signOut() {
+  localStorage.removeItem('swoop_user');
   localStorage.removeItem('swoop_email');
   USER = null;
   Object.assign(S, { user: null, wallet: 0, jobs: [], job: null, bids: [], activity: [], screen: 'login' });
@@ -1064,7 +1066,7 @@ function render() {
 }
 
 Object.assign(window, { go, pick, openTopup, closeModal, submitJob, acceptBid, advance,
-  askCancel, confirmCancel, finish, sendMsg, openJob, withdraw, hint, S });
+  askCancel, confirmCancel, finish, sendMsg, openJob, withdraw, signOut, hint, S });
 
 (async function boot() {
   try {
